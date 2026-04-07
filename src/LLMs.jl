@@ -35,6 +35,7 @@ include("buffer_pool.jl")
 include("forward_fast.jl")
 include("forward_optimized.jl")
 include("batched_dispatch.jl")
+include("metal_batch.jl")
 
 # Prefix cache
 include("prefix_cache.jl")
@@ -71,6 +72,7 @@ export Tokenizer, encode, decode, encode_chat
 export BufferPool, forward_fast!, generate_fast, sized
 export DispatchConfig, forward_opt!, generate_opt
 export BatchedCommandBuffer, begin_encoding!, encode!, submit!, wait!
+export MetalBatch, open!, dispatch!, close_and_commit!
 
 # Phase 3 prefix cache exports
 export PrefixCache, prefix_match, insert_prefix!, restore_kv!
