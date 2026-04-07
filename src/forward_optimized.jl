@@ -16,15 +16,10 @@ into the kernel dispatch, reducing per-call argument count.
 # Instead of passing hidden_size, n_heads, etc. as Int32 args every call,
 # create specialized dispatch functions that capture these constants.
 
-"""Quantized linear with zero scalar args (group_size=64 hardcoded)."""
-function qlinear_g64!(out, layer::QuantizedLinear, x)
-    O = layer.out_features
-    B = size(x, 2)
-    packed_cols = size(layer.weight, 2)
-    tg_size = min(packed_cols, 256)
-    tg_size = max(tg_size - (tg_size % 32), 32)
-    @metal threads=tg_size groups=(O, B) qmatmul_kernel_g64!(
-        out, x, layer.weight, layer.scales, layer.biases)
+"""Quantized linear with auto kernel selection (qmv for B=1, qmm for B>1)."""
+function qlinear_auto!(out, layer::QuantizedLinear, x)
+    metal_quantized_matmul_auto!(out, x, layer.weight, layer.scales, layer.biases;
+                                  group_size=layer.group_size)
     return out
 end
 
@@ -129,9 +124,9 @@ function forward_opt!(model::LlamaModel, token_ids::MtlVector{Int32},
         metal_rmsnorm!(normed, x, layer.input_layernorm, dc.eps)
 
         # Q,K,V projections — use qlinear! which avoids allocating output
-        qlinear_g64!(q_buf, layer.self_attn.q_proj, normed)
-        qlinear_g64!(k_buf, layer.self_attn.k_proj, normed)
-        qlinear_g64!(v_buf, layer.self_attn.v_proj, normed)
+        qlinear_auto!(q_buf, layer.self_attn.q_proj, normed)
+        qlinear_auto!(k_buf, layer.self_attn.k_proj, normed)
+        qlinear_auto!(v_buf, layer.self_attn.v_proj, normed)
 
         q_3d = reshape(q_buf, hd, n_q, seq_len)
         k_3d = reshape(k_buf, hd, n_kv, seq_len)
@@ -152,16 +147,16 @@ function forward_opt!(model::LlamaModel, token_ids::MtlVector{Int32},
             attn_out, scores_buf, cache.v_cache[layer_idx],
             dc.head_dim, dc.n_kv_heads, dc.gqa_ratio, Int32(effective_seq))
 
-        qlinear_g64!(o_buf, layer.self_attn.o_proj, reshape(attn_out, h, seq_len))
+        qlinear_auto!(o_buf, layer.self_attn.o_proj, reshape(attn_out, h, seq_len))
 
         # Fused: x += o_buf, then normed = rmsnorm(x)
         # Saves 1 add dispatch + 1 rmsnorm read (reads x once instead of twice)
         metal_rmsnorm_residual!(normed, x, o_buf, layer.post_attention_layernorm, dc.eps)
 
-        qlinear_g64!(gate_buf, layer.mlp.gate_proj, normed)
-        qlinear_g64!(up_buf, layer.mlp.up_proj, normed)
+        qlinear_auto!(gate_buf, layer.mlp.gate_proj, normed)
+        qlinear_auto!(up_buf, layer.mlp.up_proj, normed)
         metal_swiglu!(swiglu_buf, gate_buf, up_buf)
-        qlinear_g64!(mlp_buf, layer.mlp.down_proj, swiglu_buf)
+        qlinear_auto!(mlp_buf, layer.mlp.down_proj, swiglu_buf)
         # For the last op, we can't easily fuse the add into the next layer's rmsnorm
         # because the next layer uses a different weight vector. But we can fuse for
         # all layers except the last (where it's followed by final norm).
@@ -175,7 +170,7 @@ function forward_opt!(model::LlamaModel, token_ids::MtlVector{Int32},
 
     logits_view = sized(pool.logits, Int(dc.vocab_size), seq_len)
     if model.lm_head !== nothing
-        qlinear_g64!(logits_view, model.lm_head, normed)
+        qlinear_auto!(logits_view, model.lm_head, normed)
     else
         @metal threads=dc.tg_lm_head groups=(Int(dc.vocab_size), seq_len) lm_head_tied_kernel!(
             logits_view, model.embed.table, normed,
