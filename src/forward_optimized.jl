@@ -16,10 +16,10 @@ into the kernel dispatch, reducing per-call argument count.
 # Instead of passing hidden_size, n_heads, etc. as Int32 args every call,
 # create specialized dispatch functions that capture these constants.
 
-"""Quantized linear with auto kernel selection (qmv for B=1, qmm for B>1)."""
+"""Quantized linear with v2 kernel (best across all batch sizes)."""
 function qlinear_auto!(out, layer::QuantizedLinear, x)
-    metal_quantized_matmul_auto!(out, x, layer.weight, layer.scales, layer.biases;
-                                  group_size=layer.group_size)
+    metal_qmatmul_v2!(out, x, layer.weight, layer.scales, layer.biases;
+                       group_size=layer.group_size)
     return out
 end
 
@@ -153,9 +153,15 @@ function forward_opt!(model::LlamaModel, token_ids::MtlVector{Int32},
         # Saves 1 add dispatch + 1 rmsnorm read (reads x once instead of twice)
         metal_rmsnorm_residual!(normed, x, o_buf, layer.post_attention_layernorm, dc.eps)
 
-        # Fused gate + up + SwiGLU: 3 dispatches → 1
-        metal_fused_gate_up_swiglu!(swiglu_buf, normed,
-                                     layer.mlp.gate_proj, layer.mlp.up_proj)
+        # MLP: use fused kernel for B=1 (saves 2 dispatches), separate for B>1 (faster compute)
+        if seq_len <= 1
+            metal_fused_gate_up_swiglu!(swiglu_buf, normed,
+                                         layer.mlp.gate_proj, layer.mlp.up_proj)
+        else
+            qlinear_auto!(gate_buf, layer.mlp.gate_proj, normed)
+            qlinear_auto!(up_buf, layer.mlp.up_proj, normed)
+            metal_swiglu!(swiglu_buf, gate_buf, up_buf)
+        end
         qlinear_auto!(mlp_buf, layer.mlp.down_proj, swiglu_buf)
         # For the last op, we can't easily fuse the add into the next layer's rmsnorm
         # because the next layer uses a different weight vector. But we can fuse for
