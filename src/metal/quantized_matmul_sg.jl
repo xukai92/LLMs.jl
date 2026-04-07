@@ -3,15 +3,11 @@ Quantized matmul using simdgroup 8×8 matrix ops with 4-bit dequantization.
 
 out[O, B] = dequant(packed[packed_cols, O]) @ x[I, B]
 
-Key optimization: one packed UInt32 holds exactly 8 consecutive K values,
-which is exactly one column-set of the 32×8 W tile. So each thread reads
-one packed word + one scale + one bias, and produces all 8 columns for its row.
-This amortizes weight reads 8× vs reading one element at a time.
-
-Weight format (MLX 4-bit):
-- packed[packed_cols, O]: each UInt32 holds 8 consecutive 4-bit values
-- scales[n_groups, O], biases[n_groups, O]: per-group dequant params
-- group_size=64: 64 input elements share one scale/bias pair
+Key optimizations:
+- Full packed-word unpack: 1 UInt32 → 8 dequanted Float32 (scale/bias amortized 8×)
+- K×8 unrolling: 64 K values per barrier pair
+- Vec2 Float16 loads for x tiles
+- Unified loader: W dequant (32 threads) and x load (128 threads) in single call
 """
 
 const _QF16x2 = NTuple{2, VecElement{Float16}}
@@ -42,39 +38,34 @@ function qmatmul_sg_kernel!(out, x, packed, scales, biases,
     end
     threadgroup_barrier(Metal.MemoryFlagThreadGroup); acc = simdgroup_load(zt, (1, 1))
 
-    # W tile loader: 32 threads, each unpacks one full packed word → 8 Float32 values
-    # One packed word = 8 consecutive K values = all 8 columns of one row in the 32×8 tile
-    @inline function _lw_q(dst, k_base)
+    # Unified loader: W (threads 1-32) and x (threads 33-160) execute simultaneously
+    @inline function _load_wx(w_dst, x_dst, k_base)
         if gtid <= Int32(32)
-            row_in_tile = gtid  # 1-32
+            # W: 1 thread per row, full packed-word unpack
+            row_in_tile = gtid
             o_row = (tile_o - Int32(1)) * Int32(32) + row_in_tile
-            pc_idx = (k_base >> Int32(3)) + Int32(1)  # packed column (k_base is 8-aligned)
+            pc_idx = (k_base >> Int32(3)) + Int32(1)
             grp = (k_base >> Int32(6)) + Int32(1)
             @inbounds pv = packed[pc_idx, o_row]
             @inbounds s = Float32(scales[grp, o_row])
             @inbounds bi = Float32(biases[grp, o_row])
-            # Unpack all 8 values from this packed word
-            @inbounds dst[row_in_tile, 1] = s * Float32((pv) & UInt32(0xF)) + bi
-            @inbounds dst[row_in_tile, 2] = s * Float32((pv >> UInt32(4)) & UInt32(0xF)) + bi
-            @inbounds dst[row_in_tile, 3] = s * Float32((pv >> UInt32(8)) & UInt32(0xF)) + bi
-            @inbounds dst[row_in_tile, 4] = s * Float32((pv >> UInt32(12)) & UInt32(0xF)) + bi
-            @inbounds dst[row_in_tile, 5] = s * Float32((pv >> UInt32(16)) & UInt32(0xF)) + bi
-            @inbounds dst[row_in_tile, 6] = s * Float32((pv >> UInt32(20)) & UInt32(0xF)) + bi
-            @inbounds dst[row_in_tile, 7] = s * Float32((pv >> UInt32(24)) & UInt32(0xF)) + bi
-            @inbounds dst[row_in_tile, 8] = s * Float32((pv >> UInt32(28)) & UInt32(0xF)) + bi
-        end
-    end
-
-    # x tile loader: vec2 Float16 loads, threads 33-160
-    @inline function _lx(dst, k_base)
-        if gtid > Int32(32) && gtid <= Int32(160)
+            @inbounds w_dst[row_in_tile, 1] = s * Float32((pv) & UInt32(0xF)) + bi
+            @inbounds w_dst[row_in_tile, 2] = s * Float32((pv >> UInt32(4)) & UInt32(0xF)) + bi
+            @inbounds w_dst[row_in_tile, 3] = s * Float32((pv >> UInt32(8)) & UInt32(0xF)) + bi
+            @inbounds w_dst[row_in_tile, 4] = s * Float32((pv >> UInt32(12)) & UInt32(0xF)) + bi
+            @inbounds w_dst[row_in_tile, 5] = s * Float32((pv >> UInt32(16)) & UInt32(0xF)) + bi
+            @inbounds w_dst[row_in_tile, 6] = s * Float32((pv >> UInt32(20)) & UInt32(0xF)) + bi
+            @inbounds w_dst[row_in_tile, 7] = s * Float32((pv >> UInt32(24)) & UInt32(0xF)) + bi
+            @inbounds w_dst[row_in_tile, 8] = s * Float32((pv >> UInt32(28)) & UInt32(0xF)) + bi
+        elseif gtid <= Int32(160)
+            # x: vec2 Float16 loads
             f = gtid - Int32(33); pair = f % Int32(4); c = (f ÷ Int32(4)) + Int32(1)
             r1 = pair * Int32(2) + Int32(1)
             gk = k_base + r1; gn = (tile_b - Int32(1)) * Int32(32) + c
             p = pointer(x) + (Int64(gn - Int32(1)) * Int64(I) + Int64(gk - Int32(1))) * Int64(2)
             vec = unsafe_load(reinterpret(Core.LLVMPtr{_QF16x2, Metal.AS.Device}, p))
-            @inbounds dst[r1, c] = Float32(vec[1].value)
-            @inbounds dst[r1 + Int32(1), c] = Float32(vec[2].value)
+            @inbounds x_dst[r1, c] = Float32(vec[1].value)
+            @inbounds x_dst[r1 + Int32(1), c] = Float32(vec[2].value)
         end
     end
 
@@ -82,10 +73,10 @@ function qmatmul_sg_kernel!(out, x, packed, scales, biases,
     xo = (Int64(1), Int64(sg_n) * Int64(8) + Int64(1))
     k = Int32(0)
     while k + Int32(64) <= I
-        _lw_q(w1, k); _lx(x1, k); _lw_q(w2, k+Int32(8)); _lx(x2, k+Int32(8))
-        _lw_q(w3, k+Int32(16)); _lx(x3, k+Int32(16)); _lw_q(w4, k+Int32(24)); _lx(x4, k+Int32(24))
-        _lw_q(w5, k+Int32(32)); _lx(x5, k+Int32(32)); _lw_q(w6, k+Int32(40)); _lx(x6, k+Int32(40))
-        _lw_q(w7, k+Int32(48)); _lx(x7, k+Int32(48)); _lw_q(w8, k+Int32(56)); _lx(x8, k+Int32(56))
+        _load_wx(w1, x1, k); _load_wx(w2, x2, k + Int32(8))
+        _load_wx(w3, x3, k + Int32(16)); _load_wx(w4, x4, k + Int32(24))
+        _load_wx(w5, x5, k + Int32(32)); _load_wx(w6, x6, k + Int32(40))
+        _load_wx(w7, x7, k + Int32(48)); _load_wx(w8, x8, k + Int32(56))
         threadgroup_barrier(Metal.MemoryFlagThreadGroup)
         acc = simdgroup_multiply_accumulate(simdgroup_load(w1, wo), simdgroup_load(x1, xo), acc)
         acc = simdgroup_multiply_accumulate(simdgroup_load(w2, wo), simdgroup_load(x2, xo), acc)
@@ -98,13 +89,12 @@ function qmatmul_sg_kernel!(out, x, packed, scales, biases,
         threadgroup_barrier(Metal.MemoryFlagThreadGroup); k += Int32(64)
     end
     while k + Int32(8) <= I
-        _lw_q(w1, k); _lx(x1, k)
+        _load_wx(w1, x1, k)
         threadgroup_barrier(Metal.MemoryFlagThreadGroup)
         acc = simdgroup_multiply_accumulate(simdgroup_load(w1, wo), simdgroup_load(x1, xo), acc)
         threadgroup_barrier(Metal.MemoryFlagThreadGroup); k += Int32(8)
     end
 
-    # Store results
     simdgroup_store(acc, res, (Int64(sg_m) * Int64(8) + Int64(1), Int64(sg_n) * Int64(8) + Int64(1)))
     threadgroup_barrier(Metal.MemoryFlagThreadGroup)
     for p in Int32(0):Int32(1)
@@ -119,10 +109,7 @@ function qmatmul_sg_kernel!(out, x, packed, scales, biases,
     end; return nothing
 end
 
-"""
-Quantized matmul with simdgroup tiling. Auto-selects best kernel by batch size.
-out[O, B] = dequant(packed) @ x[I, B]
-"""
+"""Quantized matmul with simdgroup tiling. out[O, B] = dequant(packed) @ x[I, B]"""
 function metal_qmatmul_sg!(out, x, packed, scales, biases; group_size::Int=64)
     packed_cols = Int32(size(packed, 1))
     O = Int32(size(packed, 2))
