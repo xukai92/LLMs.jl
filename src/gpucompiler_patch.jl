@@ -33,12 +33,9 @@ using .GC: CompilerJob, MetalCompilerTarget, kernel_state_type,
     add_global_address_spaces!, add_argument_metadata!, add_module_metadata!,
     hide_noreturn!, replace_unreachable!, lower_llvm_intrinsics!
 
-using .GC.LLVM: Module, Function, functions, name,
+using .GC.LLVM: Module, Function, functions, name, @dispose, add!, run!,
     NewPMPassBuilder, NewPMFunctionPassManager, SimplifyCFGPass, InstCombinePass,
-    AlwaysInlinerPass, ModulePassManager, expand_reductions!,
-    has_oldpm
-
-import .GC.LLVM  # for @dispose macro
+    AlwaysInlinerPass, ModulePassManager, expand_reductions!, has_oldpm
 
 # Override finish_ir! to remove the macOS 15 gate on replace_unreachable!
 function GC.finish_ir!(@nospecialize(job::CompilerJob{MetalCompilerTarget}),
@@ -62,12 +59,12 @@ function GC.finish_ir!(@nospecialize(job::CompilerJob{MetalCompilerTarget}),
         any_replaced |= replace_unreachable!(job, f)
     end
     if any_replaced
-        @LLVM.dispose pb=NewPMPassBuilder() begin
-            LLVM.add!(pb, NewPMFunctionPassManager()) do fpm
-                LLVM.add!(fpm, SimplifyCFGPass())
-                LLVM.add!(fpm, InstCombinePass())
+        @dispose pb=NewPMPassBuilder() begin
+            add!(pb, NewPMFunctionPassManager()) do fpm
+                add!(fpm, SimplifyCFGPass())
+                add!(fpm, InstCombinePass())
             end
-            LLVM.run!(pb, mod)
+            run!(pb, mod)
         end
     end
 
@@ -76,20 +73,20 @@ function GC.finish_ir!(@nospecialize(job::CompilerJob{MetalCompilerTarget}),
         changed |= lower_llvm_intrinsics!(job, f)
     end
     if changed
-        @LLVM.dispose pb=NewPMPassBuilder() begin
-            LLVM.add!(pb, AlwaysInlinerPass())
-            LLVM.add!(pb, NewPMFunctionPassManager()) do fpm
-                LLVM.add!(fpm, SimplifyCFGPass())
-                LLVM.add!(fpm, InstCombinePass())
+        @dispose pb=NewPMPassBuilder() begin
+            add!(pb, AlwaysInlinerPass())
+            add!(pb, NewPMFunctionPassManager()) do fpm
+                add!(fpm, SimplifyCFGPass())
+                add!(fpm, InstCombinePass())
             end
-            LLVM.run!(pb, mod)
+            run!(pb, mod)
         end
     end
 
     if has_oldpm()
-        @LLVM.dispose pm=ModulePassManager() begin
+        @dispose pm=ModulePassManager() begin
             expand_reductions!(pm)
-            LLVM.run!(pm, mod)
+            run!(pm, mod)
         end
     end
 
