@@ -190,9 +190,7 @@ end
 Compute out = dequant(W) @ x where W is 4-bit quantized.
 x: (I, B) Float16, out: (O, B) Float16.
 """
-function metal_quantized_matmul!(out::MtlMatrix, x::MtlMatrix,
-                                  packed::MtlMatrix{UInt32},
-                                  scales::MtlMatrix, biases::MtlMatrix;
+function metal_quantized_matmul!(out, x, packed, scales, biases;
                                   group_size::Int=64)
     O, packed_cols = size(packed)
     I = packed_cols * 8  # 4-bit: 8 values per uint32

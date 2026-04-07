@@ -54,8 +54,7 @@ end
 Append new K and V tensors to the cache for the given layer.
 new_k, new_v: (head_dim, n_kv_heads, seq_len_new)
 """
-function append_kv!(cache::KVCache, layer_idx::Int,
-                    new_k::MtlArray{Float16, 3}, new_v::MtlArray{Float16, 3})
+function append_kv!(cache::KVCache, layer_idx::Int, new_k, new_v)
     head_dim, n_heads, new_seq = size(new_k)
     total = head_dim * n_heads * new_seq
     tg = 256

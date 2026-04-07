@@ -13,7 +13,7 @@ end
 """
     metal_add!(out, a, b) — elementwise addition
 """
-function metal_add!(out::MtlArray, a::MtlArray, b::MtlArray)
+function metal_add!(out, a, b)
     n = length(out)
     tg = 256
     @metal threads=tg groups=cld(n, tg) add_kernel!(out, a, b, Int32(n))
@@ -23,6 +23,6 @@ end
 """
     metal_add!(a, b) — in-place addition: a .+= b
 """
-function metal_add!(a::MtlArray, b::MtlArray)
+function metal_add!(a, b)
     metal_add!(a, a, b)
 end

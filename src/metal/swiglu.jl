@@ -36,7 +36,7 @@ function swiglu_kernel!(out, gate, up, n::Int32)
     return nothing
 end
 
-function metal_swiglu!(out::MtlArray{T}, gate::MtlArray{T}, up::MtlArray{T}) where T
+function metal_swiglu!(out, gate, up)
     n = length(out)
     threads_per_group = 256
     groups = cld(n, threads_per_group)

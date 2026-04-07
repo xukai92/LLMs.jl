@@ -126,8 +126,7 @@ function rope_kernel!(x, cos_table, sin_table, start_pos::Int32, half_dim::Int32
     return nothing
 end
 
-function metal_rope!(x::MtlArray{T, 3}, cos_table::MtlMatrix{Float32},
-                     sin_table::MtlMatrix{Float32}, start_pos::Int) where T
+function metal_rope!(x, cos_table, sin_table, start_pos::Int)
     head_dim, n_heads, seq_len = size(x)
     half = head_dim ÷ 2
 

@@ -144,7 +144,7 @@ function softmax_kernel!(out, x, cols::Int32)
     return nothing
 end
 
-function metal_softmax!(out::MtlMatrix, x::MtlMatrix)
+function metal_softmax!(out, x)
     rows, cols = size(x)
     tg_size = min(cols, 1024)
     tg_size = tg_size - (tg_size % 32)

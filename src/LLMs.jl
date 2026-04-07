@@ -23,6 +23,8 @@ include("model.jl")
 include("kvcache.jl")
 include("forward.jl")
 include("tokenizer.jl")
+include("buffer_pool.jl")
+include("forward_fast.jl")
 
 # Prefix cache
 include("prefix_cache.jl")
@@ -46,8 +48,9 @@ export metal_add!
 # Phase 2 model exports
 export LlamaConfig, LlamaModel, load_llama_model
 export KVCache, append_kv!, get_kv, reset!
-export forward, generate
+export forward, generate, argmax_last_col_cpu
 export Tokenizer, encode, decode, encode_chat
+export BufferPool, forward_fast!, generate_fast
 
 # Phase 3 prefix cache exports
 export PrefixCache, prefix_match, insert_prefix!, restore_kv!

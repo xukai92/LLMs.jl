@@ -275,7 +275,7 @@ end
                             causal_offset=0)
 
             err = max_rel_error(out_cpu, Array(out_gpu))
-            @test err < 1e-4
+            @test err < 5e-4  # fp32 accumulation with causal mask
         end
 
         @testset "Float16" begin

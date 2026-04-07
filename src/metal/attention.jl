@@ -267,11 +267,9 @@ Compute grouped-query attention on Metal.
 `causal`: whether to apply causal masking.
 `causal_offset`: number of previous KV positions (for decode with KV cache).
 """
-function metal_attention!(out::MtlArray{T, 3}, Q::MtlArray{T, 3},
-                          K::MtlArray{T, 3}, V::MtlArray{T, 3},
-                          scale::Float32;
+function metal_attention!(out, Q, K, V, scale::Float32;
                           causal::Bool=true,
-                          causal_offset::Int=0) where T
+                          causal_offset::Int=0)
     head_dim, n_q_heads, seq_q = size(Q)
     _, n_kv_heads, seq_kv = size(K)
     gqa_ratio = n_q_heads ÷ n_kv_heads

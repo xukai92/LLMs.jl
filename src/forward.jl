@@ -240,7 +240,7 @@ end
 
 Not performance critical — just a simple reduction.
 """
-function argmax_last_col_cpu(logits::MtlMatrix{Float16})
+function argmax_last_col_cpu(logits)
     # Get last column (last token's logits)
     h = Array(logits)
     last_col = h[:, end]

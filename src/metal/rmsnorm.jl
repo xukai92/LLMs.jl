@@ -102,7 +102,7 @@ function rmsnorm_kernel!(out, x, weight, hidden::Int32, eps::Float32)
     return nothing
 end
 
-function metal_rmsnorm!(out::MtlMatrix, x::MtlMatrix, weight::MtlVector, eps::Float32)
+function metal_rmsnorm!(out, x, weight, eps::Float32)
     hidden, batch = size(x)
     # Use up to 1024 threads per group, rounded down to multiple of 32
     tg_size = min(hidden, 1024)
