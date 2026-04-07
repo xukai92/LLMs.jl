@@ -25,18 +25,18 @@ function qmm_v2_b4_kernel!(out, x, packed, scales, biases, B::Int32)
     wid = simdgroup_index_in_threadgroup()
     nwarps = simdgroups_per_threadgroup()
 
-    packed_cols = Int32(size(packed, 2))
+    packed_cols = Int32(size(packed, 1))
     shared = MtlThreadGroupArray(Float32, 32)
 
     acc1 = 0.0f0; acc2 = 0.0f0; acc3 = 0.0f0; acc4 = 0.0f0
 
     pc = tid
     while pc <= packed_cols
-        @inbounds pv = packed[row, pc]
+        @inbounds pv = packed[pc, row]
         col_base = (pc - Int32(1)) << Int32(3)
         grp = (col_base >> Int32(6)) + Int32(1)
-        @inbounds s = Float32(scales[row, grp])
-        @inbounds bi = Float32(biases[row, grp])
+        @inbounds s = Float32(scales[grp, row])
+        @inbounds bi = Float32(biases[grp, row])
 
         k = Int32(0)
         while k < Int32(8)
@@ -95,7 +95,7 @@ function qmm_v2_kernel!(out, x, packed, scales, biases, B::Int32)
     wid = simdgroup_index_in_threadgroup()
     nwarps = simdgroups_per_threadgroup()
 
-    packed_cols = Int32(size(packed, 2))
+    packed_cols = Int32(size(packed, 1))
     shared = MtlThreadGroupArray(Float32, 32)
 
     TILE = Int32(4)
@@ -110,11 +110,11 @@ function qmm_v2_kernel!(out, x, packed, scales, biases, B::Int32)
 
     pc = tid
     while pc <= packed_cols
-        @inbounds pv = packed[row, pc]
+        @inbounds pv = packed[pc, row]
         col_base = (pc - Int32(1)) << Int32(3)
         grp = (col_base >> Int32(6)) + Int32(1)
-        @inbounds s = Float32(scales[row, grp])
-        @inbounds bi = Float32(biases[row, grp])
+        @inbounds s = Float32(scales[grp, row])
+        @inbounds bi = Float32(biases[grp, row])
 
         k = Int32(0)
         while k < Int32(8)
@@ -166,8 +166,8 @@ Optimized quantized matmul v2: auto-selects kernel based on batch size.
 """
 function metal_qmatmul_v2!(out, x, packed, scales, biases;
                             group_size::Int=64)
-    O = size(packed, 1)
-    packed_cols = size(packed, 2)
+    packed_cols = size(packed, 1)
+    O = size(packed, 2)
     B = size(x, 2)
 
     tg_size = min(packed_cols, 256)

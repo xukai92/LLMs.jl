@@ -32,22 +32,22 @@ function dequantize_cpu(packed::AbstractMatrix{UInt32},
     elems_per_u32 = 32 ÷ bits
     mask = UInt32((1 << bits) - 1)  # 0xF for 4-bit
 
-    O, packed_cols = size(packed)
+    packed_cols, O = size(packed)
     I = packed_cols * elems_per_u32
 
     W = zeros(Float32, O, I)
 
     for row in 1:O
         for pc in 1:packed_cols
-            @inbounds packed_val = packed[row, pc]
+            @inbounds packed_val = packed[pc, row]
             for k in 0:elems_per_u32-1
                 col = (pc - 1) * elems_per_u32 + k + 1
                 shift = k * bits
                 quantized = (packed_val >> shift) & mask
 
                 group_idx = (col - 1) ÷ group_size + 1
-                @inbounds s = Float32(scales[row, group_idx])
-                @inbounds b = Float32(biases[row, group_idx])
+                @inbounds s = Float32(scales[group_idx, row])
+                @inbounds b = Float32(biases[group_idx, row])
                 W[row, col] = s * Float32(quantized) + b
             end
         end
@@ -72,7 +72,7 @@ function quantized_matmul_cpu!(out::AbstractMatrix, x::AbstractMatrix,
     elems_per_u32 = 32 ÷ bits
     mask = UInt32((1 << bits) - 1)
 
-    O, packed_cols = size(packed)
+    packed_cols, O = size(packed)
     I = packed_cols * elems_per_u32
     _, B = size(x)
 
@@ -80,15 +80,15 @@ function quantized_matmul_cpu!(out::AbstractMatrix, x::AbstractMatrix,
         for row in 1:O
             acc = 0.0f0
             for pc in 1:packed_cols
-                @inbounds packed_val = packed[row, pc]
+                @inbounds packed_val = packed[pc, row]
                 for k in 0:elems_per_u32-1
                     col = (pc - 1) * elems_per_u32 + k + 1
                     shift = k * bits
                     quantized = (packed_val >> shift) & mask
 
                     group_idx = (col - 1) ÷ group_size + 1
-                    @inbounds s = Float32(scales[row, group_idx])
-                    @inbounds bi = Float32(biases[row, group_idx])
+                    @inbounds s = Float32(scales[group_idx, row])
+                    @inbounds bi = Float32(biases[group_idx, row])
                     w = s * Float32(quantized) + bi
 
                     @inbounds acc += w * Float32(x[col, b])
@@ -129,7 +129,7 @@ function qmatmul_kernel!(out, x, packed, scales, biases,
 
     pc = tid  # packed column index
     while pc <= packed_cols
-        @inbounds packed_val = packed[row, pc]
+        @inbounds packed_val = packed[pc, row]
 
         # Unpack 8 4-bit values and multiply-accumulate
         col_base = (pc - Int32(1)) * Int32(8)  # 0-indexed base column
@@ -138,8 +138,8 @@ function qmatmul_kernel!(out, x, packed, scales, biases,
         # Since group_size is typically 64 and we process 8 at a time,
         # all 8 values may fall in the same group
         group_idx = col_base ÷ group_size + Int32(1)
-        @inbounds s = Float32(scales[row, group_idx])
-        @inbounds bi = Float32(biases[row, group_idx])
+        @inbounds s = Float32(scales[group_idx, row])
+        @inbounds bi = Float32(biases[group_idx, row])
 
         # Unpack and accumulate all 8 values
         k = Int32(0)
@@ -195,17 +195,17 @@ function qmatmul_kernel_g64!(out, x, packed, scales, biases)
     wid = simdgroup_index_in_threadgroup()
     nwarps = simdgroups_per_threadgroup()
 
-    packed_cols = Int32(size(packed, 2))
+    packed_cols = Int32(size(packed, 1))
     shared = MtlThreadGroupArray(Float32, 32)
 
     acc = 0.0f0
     pc = tid
     while pc <= packed_cols
-        @inbounds packed_val = packed[row, pc]
+        @inbounds packed_val = packed[pc, row]
         col_base = (pc - Int32(1)) << Int32(3)  # * 8
         group_idx = (col_base >> Int32(6)) + Int32(1)  # ÷ 64 + 1
-        @inbounds s = Float32(scales[row, group_idx])
-        @inbounds bi = Float32(biases[row, group_idx])
+        @inbounds s = Float32(scales[group_idx, row])
+        @inbounds bi = Float32(biases[group_idx, row])
 
         k = Int32(0)
         while k < Int32(8)
@@ -254,7 +254,7 @@ x: (I, B) Float16, out: (O, B) Float16.
 """
 function metal_quantized_matmul!(out, x, packed, scales, biases;
                                   group_size::Int=64)
-    O, packed_cols = size(packed)
+    packed_cols, O = size(packed)
     I = packed_cols * 8  # 4-bit: 8 values per uint32
     _, B = size(x)
 

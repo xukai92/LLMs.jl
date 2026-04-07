@@ -20,7 +20,7 @@ function fused_gate_up_swiglu_kernel!(out, x, gate_packed, gate_scales, gate_bia
     wid = simdgroup_index_in_threadgroup()
     nwarps = simdgroups_per_threadgroup()
 
-    packed_cols = Int32(size(gate_packed, 2))
+    packed_cols = Int32(size(gate_packed, 1))
 
     # Two accumulators: one for gate, one for up
     gate_acc = 0.0f0
@@ -35,16 +35,16 @@ function fused_gate_up_swiglu_kernel!(out, x, gate_packed, gate_scales, gate_bia
         col_base = (pc - Int32(1)) << Int32(3)
 
         # Gate weights
-        @inbounds gate_pv = gate_packed[row, pc]
+        @inbounds gate_pv = gate_packed[pc, row]
         gate_group = (col_base >> Int32(6)) + Int32(1)
-        @inbounds gs = Float32(gate_scales[row, gate_group])
-        @inbounds gb = Float32(gate_biases[row, gate_group])
+        @inbounds gs = Float32(gate_scales[gate_group, row])
+        @inbounds gb = Float32(gate_biases[gate_group, row])
 
         # Up weights
-        @inbounds up_pv = up_packed[row, pc]
+        @inbounds up_pv = up_packed[pc, row]
         up_group = gate_group  # same group index (same K dimension)
-        @inbounds us = Float32(up_scales[row, up_group])
-        @inbounds ub = Float32(up_biases[row, up_group])
+        @inbounds us = Float32(up_scales[up_group, row])
+        @inbounds ub = Float32(up_biases[up_group, row])
 
         # Unpack and accumulate both projections
         k = Int32(0)
@@ -127,7 +127,7 @@ Replaces: gate = gate_proj(x); up = up_proj(x); out = silu(gate) * up
 function metal_fused_gate_up_swiglu!(out, x, gate_layer, up_layer)
     O = gate_layer.out_features
     B = size(x, 2)
-    packed_cols = size(gate_layer.weight, 2)
+    packed_cols = size(gate_layer.weight, 1)
 
     tg_size = min(packed_cols, 256)
     tg_size = max(tg_size - (tg_size % 32), 32)

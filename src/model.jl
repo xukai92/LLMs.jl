@@ -172,32 +172,20 @@ function load_quantized_linear(weights::Dict{String, Array}, prefix::String, gro
     s = MtlArray(Float16.(reinterpret(Float16, weights["$(prefix).scales"])))
     b = MtlArray(Float16.(reinterpret(Float16, weights["$(prefix).biases"])))
 
-    # Safetensors shape [O, I/8] is stored as Julia (I/8, O) due to row-major→col-major
-    # But our kernels expect (O, I/8) — so we need to understand the actual layout.
-    #
-    # In safetensors (row-major): shape is [O, packed_cols] meaning O rows.
-    # After load_safetensors (which reverses dims), Julia has (packed_cols, O).
-    # Our kernel expects packed[row, packed_col] = packed[O_idx, packed_col_idx],
-    # which means we need (O, packed_cols) — i.e., we need to transpose.
-    #
-    # Actually, let's think about this more carefully. The memory layout is:
-    # row-major [O, packed_cols]: element [o, pc] is at offset o*packed_cols + pc
-    # Julia col-major after reversing dims to (packed_cols, O):
-    #   element [pc, o] is at offset (o-1)*packed_cols + (pc-1) — same memory!
-    # So Julia's [pc, o] = safetensors' [o, pc], and the data is the same in memory.
-    #
-    # Our kernel indexes packed[row, col] where row=output_idx, col=packed_col.
-    # So we need to permutedims to get (O, packed_cols).
+    # Safetensors row-major [O, packed_cols] → Julia col-major (packed_cols, O).
+    # Keep this layout! It gives coalesced GPU memory access:
+    # Kernel threads iterate over packed_cols (first dim = contiguous in memory).
+    # Kernels now index as packed[pc, row], scales[grp, row], biases[grp, row].
 
-    w_packed = permutedims(w_u32, (2, 1))
-    s_perm = permutedims(s, (2, 1))
-    b_perm = permutedims(b, (2, 1))
+    w_packed = w_u32  # (packed_cols, O) — no transpose!
+    s_kept = s         # (n_groups, O)
+    b_kept = b         # (n_groups, O)
 
-    O = size(w_packed, 1)
-    packed_cols = size(w_packed, 2)
-    I = packed_cols * 8  # 4-bit: 8 values per uint32
+    packed_cols = size(w_packed, 1)
+    O = size(w_packed, 2)
+    I = packed_cols * 8
 
-    return QuantizedLinear(w_packed, s_perm, b_perm, O, I, group_size)
+    return QuantizedLinear(w_packed, s_kept, b_kept, O, I, group_size)
 end
 
 function load_embedding(weights::Dict{String, Array}, prefix::String,
@@ -206,19 +194,21 @@ function load_embedding(weights::Dict{String, Array}, prefix::String,
     s = MtlArray(Float16.(reinterpret(Float16, weights["$(prefix).scales"])))
     b = MtlArray(Float16.(reinterpret(Float16, weights["$(prefix).biases"])))
 
-    w_packed = permutedims(w_u32, (2, 1))
-    s_perm = permutedims(s, (2, 1))
-    b_perm = permutedims(b, (2, 1))
+    # Keep natural layout (packed_cols, O) = (embed_dim/8, vocab_size)
+    w_packed = w_u32
+    s_kept = s
+    b_kept = b
 
     # Dequantize the full embedding table on CPU for direct lookup
     w_cpu = Array(w_packed)
-    s_cpu = Array(s_perm)
-    b_cpu = Array(b_perm)
+    s_cpu = Array(s_kept)
+    b_cpu = Array(b_kept)
     table_f32 = dequantize_cpu(w_cpu, s_cpu, b_cpu; bits=4, group_size=group_size)
-    # table_f32 is (vocab_size, embed_dim) — transpose to (embed_dim, vocab_size) for our layout
+    # dequantize_cpu returns (O, I) = (vocab_size, embed_dim) with new layout
+    # Need (embed_dim, vocab_size) for our column-major embedding lookup
     table = MtlArray(Float16.(permutedims(table_f32, (2, 1))))
 
-    return QuantizedEmbedding(w_packed, s_perm, b_perm, vocab_size, embed_dim, group_size, table)
+    return QuantizedEmbedding(w_packed, s_kept, b_kept, vocab_size, embed_dim, group_size, table)
 end
 
 function load_llama_model(model_dir::String)
