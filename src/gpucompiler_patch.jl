@@ -25,63 +25,70 @@ module GPUCompilerPatch
 using Metal
 
 # Access GPUCompiler through Metal's dependency
-const GC = let
-    # GPUCompiler is loaded as a dependency of Metal
-    Base.loaded_modules[Base.PkgId(Base.UUID("61eb1bfa-7361-4325-ad38-22787b887f55"), "GPUCompiler")]
-end
-const LLVM = GC.LLVM
+const GC = Base.loaded_modules[Base.PkgId(
+    Base.UUID("61eb1bfa-7361-4325-ad38-22787b887f55"), "GPUCompiler")]
+
+using .GC: CompilerJob, MetalCompilerTarget, kernel_state_type,
+    kernel_state_to_reference!, add_parameter_address_spaces!,
+    add_global_address_spaces!, add_argument_metadata!, add_module_metadata!,
+    hide_noreturn!, replace_unreachable!, lower_llvm_intrinsics!
+
+using .GC.LLVM: Module, Function, functions, name,
+    NewPMPassBuilder, NewPMFunctionPassManager, SimplifyCFGPass, InstCombinePass,
+    AlwaysInlinerPass, ModulePassManager, expand_reductions!,
+    has_oldpm
+
+import .GC.LLVM  # for @dispose macro
 
 # Override finish_ir! to remove the macOS 15 gate on replace_unreachable!
-function GC.finish_ir!(@nospecialize(job::GC.CompilerJob{GC.MetalCompilerTarget}), mod::LLVM.Module,
-                       entry::LLVM.Function)
-    entry_fn = LLVM.name(entry)
-
-    if job.config.kernel && GC.kernel_state_type(job) !== Nothing
-        entry = GC.kernel_state_to_reference!(job, mod, entry)
+function GC.finish_ir!(@nospecialize(job::CompilerJob{MetalCompilerTarget}),
+                       mod::Module, entry::Function)
+    if job.config.kernel && kernel_state_type(job) !== Nothing
+        entry = kernel_state_to_reference!(job, mod, entry)
     end
 
     if job.config.kernel
-        entry = GC.add_parameter_address_spaces!(job, mod, entry)
-        entry = GC.add_global_address_spaces!(job, mod, entry)
-        GC.add_argument_metadata!(job, mod, entry)
-        GC.add_module_metadata!(job, mod)
+        entry = add_parameter_address_spaces!(job, mod, entry)
+        entry = add_global_address_spaces!(job, mod, entry)
+        add_argument_metadata!(job, mod, entry)
+        add_module_metadata!(job, mod)
     end
 
-    GC.hide_noreturn!(mod)
+    hide_noreturn!(mod)
 
     # PATCHED: always run replace_unreachable! (removed macOS < 15 gate)
     any_replaced = false
-    for f in LLVM.functions(mod)
-        any_replaced |= GC.replace_unreachable!(job, f)
+    for f in functions(mod)
+        any_replaced |= replace_unreachable!(job, f)
     end
     if any_replaced
-        @LLVM.dispose pb=LLVM.NewPMPassBuilder() begin
-            LLVM.add!(pb, LLVM.NewPMFunctionPassManager()) do fpm
-                LLVM.add!(fpm, LLVM.SimplifyCFGPass())
-                LLVM.add!(fpm, LLVM.InstCombinePass())
+        @LLVM.dispose pb=NewPMPassBuilder() begin
+            LLVM.add!(pb, NewPMFunctionPassManager()) do fpm
+                LLVM.add!(fpm, SimplifyCFGPass())
+                LLVM.add!(fpm, InstCombinePass())
             end
             LLVM.run!(pb, mod)
         end
     end
 
     changed = false
-    for f in LLVM.functions(mod)
-        changed |= GC.lower_llvm_intrinsics!(job, f)
+    for f in functions(mod)
+        changed |= lower_llvm_intrinsics!(job, f)
     end
     if changed
-        @LLVM.dispose pb=LLVM.NewPMPassBuilder() begin
-            LLVM.add!(pb, LLVM.AlwaysInlinerPass())
-            LLVM.add!(pb, LLVM.NewPMFunctionPassManager()) do fpm
-                LLVM.add!(fpm, LLVM.SimplifyCFGPass())
-                LLVM.add!(fpm, LLVM.InstCombinePass())
+        @LLVM.dispose pb=NewPMPassBuilder() begin
+            LLVM.add!(pb, AlwaysInlinerPass())
+            LLVM.add!(pb, NewPMFunctionPassManager()) do fpm
+                LLVM.add!(fpm, SimplifyCFGPass())
+                LLVM.add!(fpm, InstCombinePass())
             end
             LLVM.run!(pb, mod)
         end
     end
 
-    if LLVM.has_oldpm()
-        @LLVM.dispose pm=LLVM.ModulePassManager() begin
-            LLVM.expand_reductions!(pm)
+    if has_oldpm()
+        @LLVM.dispose pm=ModulePassManager() begin
+            expand_reductions!(pm)
             LLVM.run!(pm, mod)
         end
     end
