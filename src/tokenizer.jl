@@ -96,6 +96,6 @@ elif cmd["action"] == "encode_chat":
     print(json.dumps({"ids": ids, "text": text}))
 """
     # Use uv to run with transformers installed
-    output = read(`uv run --with transformers --with tokenizers python3 -c $py_code $(tok.model_dir) $cmd`, String)
+    output = read(`uv run --with transformers --with tokenizers --with jinja2 python3 -c $py_code $(tok.model_dir) $cmd`, String)
     return JSON3.read(strip(output))
 end

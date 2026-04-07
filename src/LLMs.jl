@@ -27,6 +27,9 @@ include("tokenizer.jl")
 # Prefix cache
 include("prefix_cache.jl")
 
+# HTTP server
+include("server.jl")
+
 # Phase 0 exports
 export load_safetensors, load_safetensors_lazy, SafeTensorInfo
 export vector_add!, metal_vector_add!
@@ -49,5 +52,8 @@ export Tokenizer, encode, decode, encode_chat
 # Phase 3 prefix cache exports
 export PrefixCache, prefix_match, insert_prefix!, restore_kv!
 export generate_with_cache
+
+# Phase 4 server exports
+export serve, InferenceEngine, apply_chat_template
 
 end # module LLMs
