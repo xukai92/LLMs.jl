@@ -93,4 +93,20 @@ end
 
 export simdgroup_load_patched, simdgroup_store_patched
 
+# ── Mixed-precision simdgroup_multiply_accumulate ──
+# Metal AIR supports: half8x8 × half8x8 + float8x8 → float8x8
+# This is the most common ML use case but Metal.jl only has same-type versions.
+@inline function simdgroup_multiply_accumulate_f16f32(
+    a::NTuple{64, VecElement{Float16}},
+    b::NTuple{64, VecElement{Float16}},
+    c::NTuple{64, VecElement{Float32}},
+)
+    ccall("extern air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f16.v64f16.v64f32",
+        llvmcall, NTuple{64, VecElement{Float32}},
+        (NTuple{64, VecElement{Float16}}, NTuple{64, VecElement{Float16}}, NTuple{64, VecElement{Float32}}),
+        a, b, c)
+end
+
+export simdgroup_multiply_accumulate_f16f32
+
 end # module

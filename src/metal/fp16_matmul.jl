@@ -3,10 +3,16 @@ FP16 tiled matrix multiply using simdgroup 8×8 matrix ops.
 
 out[M, N] = W[M, K] @ x[K, N]
 
-Auto-selects from three kernel variants by batch size:
+Auto-selects kernel by batch size:
 - 1-SG: B<16, one simdgroup per 8×8 tile (32 threads)
-- 2×2 K×2: B=16, four SGs in 2×2 grid, 16×16 tile, K-unrolled ×2 (128 threads)
-- 2×2 K×4: B≥32, same tiling, K-unrolled ×4 for fewer barriers (128 threads)
+- 2×2 K×2: 16≤B<32, four SGs in 2×2 grid, 16×16 tile (128 threads)
+- 4×4 K×8 ptr: B≥32, pointer+vec2 loading, no bounds checks (512 threads)
+
+Key optimizations:
+- pointer() + UInt32 vec2 loads: halves memory transactions vs scalar
+- K×8 unrolling: 64 K values per barrier pair (48 barriers for K=3072)
+- Bounds-check-free: matrices padded to tile multiples at model load time
+- Mixed-precision MAC available (Float16×Float16→Float32) via Metal.jl patch
 """
 
 # ── 1-SG kernel (8×8 tile, 32 threads) ──
@@ -315,12 +321,97 @@ function fp16_matmul_4x4_k8_unsafe!(out, W, x, M::Int32, N::Int32, K::Int32)
     end; return nothing
 end
 
+# ── Pointer+vec2 unsafe 4×4 K×8 (best single-buffer variant) ──
+# Loads 2×Float16 as one UInt32 via pointer arithmetic, halving memory transactions.
+# All 512 threads participate in loading both W and x tiles.
+function fp16_matmul_4x4_k8_ptr!(out, W, x, M::Int32, N::Int32, K::Int32)
+    tile_m_grp = Int32(threadgroup_position_in_grid().x)
+    tile_n_grp = Int32(threadgroup_position_in_grid().y)
+    sg = Int32(simdgroup_index_in_threadgroup()); tid = Int32(thread_index_in_simdgroup())
+    gtid = (sg - Int32(1)) * Int32(32) + tid
+    sg_m = (sg - Int32(1)) % Int32(4); sg_n = (sg - Int32(1)) ÷ Int32(4)
+    w1 = MtlThreadGroupArray(Float32, (32, 8)); x1 = MtlThreadGroupArray(Float32, (8, 32))
+    w2 = MtlThreadGroupArray(Float32, (32, 8)); x2 = MtlThreadGroupArray(Float32, (8, 32))
+    w3 = MtlThreadGroupArray(Float32, (32, 8)); x3 = MtlThreadGroupArray(Float32, (8, 32))
+    w4 = MtlThreadGroupArray(Float32, (32, 8)); x4 = MtlThreadGroupArray(Float32, (8, 32))
+    w5 = MtlThreadGroupArray(Float32, (32, 8)); x5 = MtlThreadGroupArray(Float32, (8, 32))
+    w6 = MtlThreadGroupArray(Float32, (32, 8)); x6 = MtlThreadGroupArray(Float32, (8, 32))
+    w7 = MtlThreadGroupArray(Float32, (32, 8)); x7 = MtlThreadGroupArray(Float32, (8, 32))
+    w8 = MtlThreadGroupArray(Float32, (32, 8)); x8 = MtlThreadGroupArray(Float32, (8, 32))
+    zt = MtlThreadGroupArray(Float32, (8, 8)); res = MtlThreadGroupArray(Float32, (32, 32))
+    if sg == Int32(1) && tid <= Int32(32)
+        for e in Int32(0):Int32(1)
+            f = (tid - Int32(1)) * Int32(2) + e; r = (f % Int32(8)) + Int32(1); c = (f ÷ Int32(8)) + Int32(1)
+            if c <= Int32(8); @inbounds zt[r, c] = 0f0; end
+        end
+    end
+    threadgroup_barrier(Metal.MemoryFlagThreadGroup); acc = simdgroup_load(zt, (1, 1))
+    # W tile: 32 rows × 8 cols = 256 elements. With vec2 loading (2 per thread), 128 threads suffice.
+    @inline function _lw(dst, ko)
+        if gtid <= Int32(128)
+            f = gtid - Int32(1); pair = f % Int32(16); c = (f ÷ Int32(16)) + Int32(1)
+            r1 = pair * Int32(2) + Int32(1)
+            gm = (tile_m_grp - Int32(1)) * Int32(32) + r1; gk = ko + c
+            p = pointer(W) + (Int64(gk - Int32(1)) * Int64(M) + Int64(gm - Int32(1))) * Int64(2)
+            pk = unsafe_load(reinterpret(Core.LLVMPtr{UInt32, Metal.AS.Device}, p))
+            @inbounds dst[r1, c] = Float32(reinterpret(Float16, UInt16(pk & UInt32(0xFFFF))))
+            @inbounds dst[r1 + Int32(1), c] = Float32(reinterpret(Float16, UInt16((pk >> UInt32(16)) & UInt32(0xFFFF))))
+        end
+    end
+    # x tile: 8 rows × 32 cols = 256 elements. Vec2 along rows (K dim), 128 threads.
+    @inline function _lx(dst, ko)
+        if gtid > Int32(128) && gtid <= Int32(256)
+            f = gtid - Int32(129); pair = f % Int32(4); c = (f ÷ Int32(4)) + Int32(1)
+            r1 = pair * Int32(2) + Int32(1)
+            gk = ko + r1; gn = (tile_n_grp - Int32(1)) * Int32(32) + c
+            p = pointer(x) + (Int64(gn - Int32(1)) * Int64(K) + Int64(gk - Int32(1))) * Int64(2)
+            pk = unsafe_load(reinterpret(Core.LLVMPtr{UInt32, Metal.AS.Device}, p))
+            @inbounds dst[r1, c] = Float32(reinterpret(Float16, UInt16(pk & UInt32(0xFFFF))))
+            @inbounds dst[r1 + Int32(1), c] = Float32(reinterpret(Float16, UInt16((pk >> UInt32(16)) & UInt32(0xFFFF))))
+        end
+    end
+    wo = (Int64(sg_m) * Int64(8) + Int64(1), Int64(1))
+    xo = (Int64(1), Int64(sg_n) * Int64(8) + Int64(1))
+    k = Int32(0)
+    while k + Int32(64) <= K
+        _lw(w1, k); _lx(x1, k); _lw(w2, k + Int32(8)); _lx(x2, k + Int32(8))
+        _lw(w3, k + Int32(16)); _lx(x3, k + Int32(16)); _lw(w4, k + Int32(24)); _lx(x4, k + Int32(24))
+        _lw(w5, k + Int32(32)); _lx(x5, k + Int32(32)); _lw(w6, k + Int32(40)); _lx(x6, k + Int32(40))
+        _lw(w7, k + Int32(48)); _lx(x7, k + Int32(48)); _lw(w8, k + Int32(56)); _lx(x8, k + Int32(56))
+        threadgroup_barrier(Metal.MemoryFlagThreadGroup)
+        acc = simdgroup_multiply_accumulate(simdgroup_load(w1, wo), simdgroup_load(x1, xo), acc)
+        acc = simdgroup_multiply_accumulate(simdgroup_load(w2, wo), simdgroup_load(x2, xo), acc)
+        acc = simdgroup_multiply_accumulate(simdgroup_load(w3, wo), simdgroup_load(x3, xo), acc)
+        acc = simdgroup_multiply_accumulate(simdgroup_load(w4, wo), simdgroup_load(x4, xo), acc)
+        acc = simdgroup_multiply_accumulate(simdgroup_load(w5, wo), simdgroup_load(x5, xo), acc)
+        acc = simdgroup_multiply_accumulate(simdgroup_load(w6, wo), simdgroup_load(x6, xo), acc)
+        acc = simdgroup_multiply_accumulate(simdgroup_load(w7, wo), simdgroup_load(x7, xo), acc)
+        acc = simdgroup_multiply_accumulate(simdgroup_load(w8, wo), simdgroup_load(x8, xo), acc)
+        threadgroup_barrier(Metal.MemoryFlagThreadGroup); k += Int32(64)
+    end
+    while k < K
+        _lw(w1, k); _lx(x1, k); threadgroup_barrier(Metal.MemoryFlagThreadGroup)
+        acc = simdgroup_multiply_accumulate(simdgroup_load(w1, wo), simdgroup_load(x1, xo), acc)
+        threadgroup_barrier(Metal.MemoryFlagThreadGroup); k += Int32(8)
+    end
+    simdgroup_store(acc, res, (Int64(sg_m) * Int64(8) + Int64(1), Int64(sg_n) * Int64(8) + Int64(1)))
+    threadgroup_barrier(Metal.MemoryFlagThreadGroup)
+    for p in Int32(0):Int32(1)
+        idx = (gtid - Int32(1)) * Int32(2) + p + Int32(1)
+        if idx <= Int32(1024)
+            r = ((idx - Int32(1)) % Int32(32)) + Int32(1); c = ((idx - Int32(1)) ÷ Int32(32)) + Int32(1)
+            gm = (tile_m_grp - Int32(1)) * Int32(32) + r; gn = (tile_n_grp - Int32(1)) * Int32(32) + c
+            @inbounds out[gm, gn] = Float16(res[r, c])
+        end
+    end; return nothing
+end
+
 """FP16 matmul with auto kernel selection. Assumes padded inputs for B≥32."""
 function metal_fp16_matmul!(out, W, x)
     M = Int32(size(W, 1)); K = Int32(size(W, 2)); N = Int32(size(x, 2))
     if N >= 32
-        # Unsafe 4×4 K×8: fastest for B≥32 (requires M,N,K multiples of 32/8)
-        @metal threads=512 groups=(cld(Int(M), 32), cld(Int(N), 32)) fp16_matmul_4x4_k8_unsafe!(
+        # Pointer+vec2 4×4 K×8: best for B≥32 (requires padded M,N,K)
+        @metal threads=512 groups=(cld(Int(M), 32), cld(Int(N), 32)) fp16_matmul_4x4_k8_ptr!(
             out, W, x, M, N, K)
     elseif N >= 16
         # K×2 unrolled 2×2
