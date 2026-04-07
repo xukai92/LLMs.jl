@@ -20,6 +20,7 @@ include("metal/elementwise.jl")
 include("metal/quantized_matmul_tiled.jl")
 include("metal/quantized_matmul_simd.jl")
 include("metal/quantized_matmul_v2.jl")
+include("metal/quantized_matmul_v3.jl")
 include("metal/argmax.jl")
 include("metal/fused_mlp.jl")
 
@@ -54,6 +55,7 @@ export metal_add!
 export metal_quantized_matmul_auto!, qlinear_auto!
 export metal_quantized_matmul_simd!
 export metal_qmatmul_v2!
+export metal_qmatmul_v3!
 export metal_fused_gate_up_swiglu!
 export metal_argmax_last_col, metal_argmax_last_col!
 

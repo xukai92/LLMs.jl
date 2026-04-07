@@ -16,10 +16,10 @@ into the kernel dispatch, reducing per-call argument count.
 # Instead of passing hidden_size, n_heads, etc. as Int32 args every call,
 # create specialized dispatch functions that capture these constants.
 
-"""Quantized linear with v2 kernel (best across all batch sizes)."""
+"""Quantized linear with best-available kernel per batch size."""
 function qlinear_auto!(out, layer::QuantizedLinear, x)
     metal_qmatmul_v2!(out, x, layer.weight, layer.scales, layer.biases;
-                       group_size=layer.group_size)
+                        group_size=layer.group_size)
     return out
 end
 
