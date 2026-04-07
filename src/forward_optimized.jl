@@ -112,7 +112,6 @@ function forward_opt!(model::LlamaModel, token_ids::MtlVector{Int32},
     mlp_buf = sized(pool.mlp_out, h, seq_len)
 
     effective_seq = cache.seq_len + seq_len
-    scores_buf = sized(pool.scores, n_q, seq_len, effective_seq)
     attn_out = sized(pool.attn_out_3d, hd, n_q, seq_len)
 
     start_pos = cache.seq_len + 1
@@ -137,15 +136,10 @@ function forward_opt!(model::LlamaModel, token_ids::MtlVector{Int32},
 
         append_kv!(cache, layer_idx, k_3d, v_3d)
 
-        # Attention directly from cache
-        @metal threads=tg_attn_score groups=(n_q, seq_len) attn_scores_softmax_kernel!(
-            scores_buf, q_3d, cache.k_cache[layer_idx],
-            dc.head_dim, dc.n_kv_heads, dc.gqa_ratio, Int32(effective_seq),
-            dc.scale, Int32(cache.seq_len), Int32(1))
-
-        @metal threads=dc.tg_attn_value groups=(n_q, seq_len) attn_value_kernel!(
-            attn_out, scores_buf, cache.v_cache[layer_idx],
-            dc.head_dim, dc.n_kv_heads, dc.gqa_ratio, Int32(effective_seq))
+        # Flash attention: no score matrix materialization
+        metal_flash_attention!(attn_out, q_3d, cache.k_cache[layer_idx],
+                               cache.v_cache[layer_idx], dc.scale;
+                               causal=true, causal_offset=cache.seq_len)
 
         qlinear_auto!(o_buf, layer.self_attn.o_proj, reshape(attn_out, h, seq_len))
 
