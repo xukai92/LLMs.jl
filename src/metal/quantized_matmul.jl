@@ -184,6 +184,68 @@ function qmatmul_kernel!(out, x, packed, scales, biases,
     return nothing
 end
 
+# Zero-scalar-arg variant: derives all dims from buffer sizes
+# Assumes group_size=64, bits=4 (hardcoded for Llama-3.2-3B)
+function qmatmul_kernel_g64!(out, x, packed, scales, biases)
+    row = Int32(threadgroup_position_in_grid().x)
+    b = Int32(threadgroup_position_in_grid().y)
+    tid = Int32(thread_position_in_threadgroup().x)
+    tg_size = Int32(threads_per_threadgroup().x)
+    lane = thread_index_in_simdgroup()
+    wid = simdgroup_index_in_threadgroup()
+    nwarps = simdgroups_per_threadgroup()
+
+    packed_cols = Int32(size(packed, 2))
+    shared = MtlThreadGroupArray(Float32, 32)
+
+    acc = 0.0f0
+    pc = tid
+    while pc <= packed_cols
+        @inbounds packed_val = packed[row, pc]
+        col_base = (pc - Int32(1)) << Int32(3)  # * 8
+        group_idx = (col_base >> Int32(6)) + Int32(1)  # ÷ 64 + 1
+        @inbounds s = Float32(scales[row, group_idx])
+        @inbounds bi = Float32(biases[row, group_idx])
+
+        k = Int32(0)
+        while k < Int32(8)
+            col = col_base + k + Int32(1)
+            quantized = (packed_val >> (UInt32(k) << UInt32(2))) & UInt32(0xF)
+            w = s * Float32(quantized) + bi
+            @inbounds acc += w * Float32(x[col, b])
+            k += Int32(1)
+        end
+        pc += tg_size
+    end
+
+    offset = UInt32(1)
+    while offset < threads_per_simdgroup()
+        acc += simd_shuffle_down(acc, offset)
+        offset <<= 1
+    end
+    if lane == UInt32(1)
+        @inbounds shared[wid] = acc
+    end
+    threadgroup_barrier(Metal.MemoryFlagThreadGroup)
+
+    if wid == UInt32(1)
+        acc = if lane <= nwarps
+            @inbounds shared[lane]
+        else
+            0.0f0
+        end
+        offset = UInt32(1)
+        while offset < threads_per_simdgroup()
+            acc += simd_shuffle_down(acc, offset)
+            offset <<= 1
+        end
+        if lane == UInt32(1)
+            @inbounds out[row, b] = typeof(out[1,1])(acc)
+        end
+    end
+    return nothing
+end
+
 """
     metal_quantized_matmul!(out, x, packed_weights, scales, biases; group_size=64)
 

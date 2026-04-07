@@ -26,6 +26,7 @@ include("forward.jl")
 include("tokenizer.jl")
 include("buffer_pool.jl")
 include("forward_fast.jl")
+include("forward_optimized.jl")
 
 # Prefix cache
 include("prefix_cache.jl")
@@ -53,6 +54,7 @@ export KVCache, append_kv!, get_kv, reset!
 export forward, generate, argmax_last_col_cpu
 export Tokenizer, encode, decode, encode_chat
 export BufferPool, forward_fast!, generate_fast, sized
+export DispatchConfig, forward_opt!, generate_opt
 
 # Phase 3 prefix cache exports
 export PrefixCache, prefix_match, insert_prefix!, restore_kv!
