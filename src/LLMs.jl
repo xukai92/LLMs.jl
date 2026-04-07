@@ -27,6 +27,7 @@ include("tokenizer.jl")
 include("buffer_pool.jl")
 include("forward_fast.jl")
 include("forward_optimized.jl")
+include("batched_dispatch.jl")
 
 # Prefix cache
 include("prefix_cache.jl")
@@ -39,7 +40,7 @@ export load_safetensors, load_safetensors_lazy, SafeTensorInfo
 export vector_add!, metal_vector_add!
 
 # Phase 1 kernel exports
-export rmsnorm_cpu!, metal_rmsnorm!
+export rmsnorm_cpu!, metal_rmsnorm!, metal_rmsnorm_residual!
 export compute_rope_freqs, rope_cpu!, metal_rope!
 export swiglu_cpu!, metal_swiglu!
 export softmax_cpu!, metal_softmax!
@@ -55,6 +56,7 @@ export forward, generate, argmax_last_col_cpu
 export Tokenizer, encode, decode, encode_chat
 export BufferPool, forward_fast!, generate_fast, sized
 export DispatchConfig, forward_opt!, generate_opt
+export BatchedCommandBuffer, begin_encoding!, encode!, submit!, wait!
 
 # Phase 3 prefix cache exports
 export PrefixCache, prefix_match, insert_prefix!, restore_kv!

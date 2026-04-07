@@ -102,6 +102,74 @@ function rmsnorm_kernel!(out, x, weight, hidden::Int32, eps::Float32)
     return nothing
 end
 
+# Fused RMSNorm + residual add: out = rmsnorm(x + residual, weight)
+# Also writes x = x + residual (in-place residual update)
+function rmsnorm_residual_kernel!(out, x, residual, weight, hidden::Int32, eps::Float32)
+    row = threadgroup_position_in_grid().x
+    tid = thread_position_in_threadgroup().x
+    tg_size = threads_per_threadgroup().x
+    lane = thread_index_in_simdgroup()
+    wid = simdgroup_index_in_threadgroup()
+    nwarps = simdgroups_per_threadgroup()
+
+    shared = MtlThreadGroupArray(Float32, 32)
+
+    # Phase 1: Add residual to x in-place, compute sum of squares
+    ss = 0.0f0
+    i = tid
+    while i <= hidden
+        @inbounds val = Float32(x[i, row]) + Float32(residual[i, row])
+        @inbounds x[i, row] = typeof(x[1,1])(val)  # write back x = x + residual
+        ss += val * val
+        i += tg_size
+    end
+
+    # Simdgroup reduction (same as rmsnorm_kernel!)
+    offset = UInt32(1)
+    while offset < threads_per_simdgroup()
+        ss += simd_shuffle_down(ss, offset)
+        offset <<= 1
+    end
+    if lane == UInt32(1)
+        @inbounds shared[wid] = ss
+    end
+    threadgroup_barrier(Metal.MemoryFlagThreadGroup)
+    if wid == UInt32(1)
+        ss = if lane <= nwarps
+            @inbounds shared[lane]
+        else
+            0.0f0
+        end
+        offset = UInt32(1)
+        while offset < threads_per_simdgroup()
+            ss += simd_shuffle_down(ss, offset)
+            offset <<= 1
+        end
+        if lane == UInt32(1)
+            @inbounds shared[1] = 1.0f0 / sqrt(ss / Float32(hidden) + eps)
+        end
+    end
+    threadgroup_barrier(Metal.MemoryFlagThreadGroup)
+
+    @inbounds scale = shared[1]
+    i = tid
+    while i <= hidden
+        @inbounds out[i, row] = typeof(x[1,1])(Float32(x[i, row]) * scale * Float32(weight[i]))
+        i += tg_size
+    end
+    return nothing
+end
+
+"""Fused RMSNorm with residual add: x += residual, out = rmsnorm(x, weight)"""
+function metal_rmsnorm_residual!(out, x, residual, weight, eps::Float32)
+    hidden, batch = size(x)
+    tg_size = min(hidden, 1024)
+    tg_size = tg_size - (tg_size % 32)
+    @metal threads=tg_size groups=batch rmsnorm_residual_kernel!(
+        out, x, residual, weight, Int32(hidden), eps)
+    return out
+end
+
 function metal_rmsnorm!(out, x, weight, eps::Float32)
     hidden, batch = size(x)
     # Use up to 1024 threads per group, rounded down to multiple of 32

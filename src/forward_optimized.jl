@@ -153,15 +153,18 @@ function forward_opt!(model::LlamaModel, token_ids::MtlVector{Int32},
             dc.head_dim, dc.n_kv_heads, dc.gqa_ratio, Int32(effective_seq))
 
         qlinear_g64!(o_buf, layer.self_attn.o_proj, reshape(attn_out, h, seq_len))
-        metal_add!(x, o_buf)
 
-        # Post-attention
-        metal_rmsnorm!(normed, x, layer.post_attention_layernorm, dc.eps)
+        # Fused: x += o_buf, then normed = rmsnorm(x)
+        # Saves 1 add dispatch + 1 rmsnorm read (reads x once instead of twice)
+        metal_rmsnorm_residual!(normed, x, o_buf, layer.post_attention_layernorm, dc.eps)
 
         qlinear_g64!(gate_buf, layer.mlp.gate_proj, normed)
         qlinear_g64!(up_buf, layer.mlp.up_proj, normed)
         metal_swiglu!(swiglu_buf, gate_buf, up_buf)
         qlinear_g64!(mlp_buf, layer.mlp.down_proj, swiglu_buf)
+        # For the last op, we can't easily fuse the add into the next layer's rmsnorm
+        # because the next layer uses a different weight vector. But we can fuse for
+        # all layers except the last (where it's followed by final norm).
         metal_add!(x, mlp_buf)
     end
 
