@@ -6,20 +6,21 @@ This document describes the development and optimization of a Float16 matrix mul
 
 ### Final results (FP16 3072×3072, M3 Max)
 
-| Batch | Julia (ms) | MLX (ms) | MPS (ms) | Julia/MLX |
-|-------|-----------|---------|---------|-----------|
-| 1 | 0.47 | 0.26 | 0.37 | 1.82x |
-| 2 | 0.41 | 0.40 | 0.38 | **1.03x** |
-| 4 | 0.42 | 0.40 | 0.40 | **1.04x** |
-| 8 | 0.43 | 0.40 | 0.46 | 1.08x |
-| 16 | 0.43 | 0.37 | 0.52 | 1.15x |
-| 32 | 0.42 | 0.48 | 0.64 | **0.88x ✓** |
-| 64 | 0.53 | 0.69 | 0.42 | **0.76x ✓** |
-| 128 | 0.81 | 0.77 | 0.52 | **1.05x ✓** |
-| 256 | 1.30 | 0.67 | 0.81 | 1.94x |
-| 512 | 2.26 | 1.01 | 1.23 | 2.22x |
+| Batch | Julia (ms) | MLX (ms) | Julia/MLX |
+|-------|-----------|---------|-----------|
+| 1 | 0.85 | 0.26 | 3.28x |
+| 2 | 0.55 | 0.40 | 1.39x |
+| 4 | 0.56 | 0.40 | 1.40x |
+| 8 | 0.57 | 0.40 | 1.44x |
+| 16 | 0.45 | 0.37 | 1.22x |
+| 32 | 0.43 | 0.48 | **0.90x ✓** |
+| 64 | 0.54 | 0.69 | **0.79x ✓** |
+| 128 | 0.82 | 0.77 | **1.06x ✓** |
+| 256 | 1.30 | 0.67 | 1.94x |
+| 512 | 2.23 | 1.01 | 2.21x |
 
-Julia **beats MLX at B=32–64** (by up to 24%) and matches at B=2–16 and B=128.
+Julia **beats MLX at B=32–64** (by up to 21%) and matches at B=128.
+Results include pointer+vec2 loading and GPUCompiler trap elimination patches.
 
 ## Architecture
 
@@ -141,7 +142,9 @@ MLX's STEEL GEMM kernel (`mlx/backend/metal/kernels/steel/gemm/`) has these key 
 
 3. **Per-dispatch MTLBuffer allocation**: Each `@metal` call allocates a new MTLBuffer for each non-buffer kernel argument (~6μs overhead × N args). Our `MetalCommandBatch` prototype in `metal_dispatch_ext.jl` batches dispatches into one command buffer.
 
-4. **Int32 sign checks**: Every `Int32(x)` conversion includes a `check_sign_bit` that generates a trap instruction. Using `@inbounds` doesn't suppress this. Impact is measurable in tight loops.
+4. **Int32 sign checks** (FIXED): Every `Int32(x)` conversion includes a `check_sign_bit` that generates a trap instruction. **Fix**: GPUCompiler.jl's `replace_unreachable!` pass was gated behind `macos < v"15"`, leaving 323 traps in our IR. Removing the gate eliminates all traps, giving 10-42% speedup at small batch sizes. See `src/gpucompiler_patch.jl`.
+
+5. **Mixed-precision simdgroup MAC** (FIXED): Metal.jl only exposes same-type `simdgroup_multiply_accumulate`. **Fix**: Added `Float16×Float16→Float32` variant using AIR intrinsic `air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f16.v64f16.v64f32`. See `src/metal_simd_patch.jl`.
 
 ### Performance ceiling at B≥256
 

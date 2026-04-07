@@ -5,6 +5,9 @@ using KernelAbstractions
 using JSON3
 using Mmap
 
+# Patches for Metal.jl and GPUCompiler.jl (must be loaded before kernels)
+include("gpucompiler_patch.jl")  # trap elimination on macOS 15+
+
 # Safetensors weight loading
 include("safetensors.jl")
 
