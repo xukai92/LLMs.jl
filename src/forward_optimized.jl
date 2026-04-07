@@ -172,9 +172,11 @@ function forward_opt!(model::LlamaModel, token_ids::MtlVector{Int32},
     if model.lm_head !== nothing
         qlinear_auto!(logits_view, model.lm_head, normed)
     else
-        @metal threads=dc.tg_lm_head groups=(Int(dc.vocab_size), seq_len) lm_head_tied_kernel!(
-            logits_view, model.embed.table, normed,
-            dc.vocab_size, dc.hidden)
+        # Use quantized matmul on the raw embedding weights (tied lm_head)
+        # Much faster than the 128K-threadgroup dot-product kernel
+        metal_qmatmul_v2!(logits_view, normed,
+                           model.embed.weight, model.embed.scales, model.embed.biases;
+                           group_size=model.embed.group_size)
     end
 
     return logits_view
