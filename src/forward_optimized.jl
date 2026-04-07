@@ -122,10 +122,17 @@ function forward_opt!(model::LlamaModel, token_ids::MtlVector{Int32},
         # RMSNorm → Q,K,V → RoPE → KV append → Attn → O → Residual → RMSNorm → MLP → Residual
         metal_rmsnorm!(normed, x, layer.input_layernorm, dc.eps)
 
-        # Q,K,V projections — use qlinear! which avoids allocating output
-        qlinear_auto!(q_buf, layer.self_attn.q_proj, normed)
-        qlinear_auto!(k_buf, layer.self_attn.k_proj, normed)
-        qlinear_auto!(v_buf, layer.self_attn.v_proj, normed)
+        # Q,K,V projections
+        if seq_len <= 1
+            # Fused Q+K+V for B=1: 3 dispatches → 1
+            metal_fused_qkv!(q_buf, k_buf, v_buf, normed,
+                              layer.self_attn.q_proj, layer.self_attn.k_proj,
+                              layer.self_attn.v_proj)
+        else
+            qlinear_auto!(q_buf, layer.self_attn.q_proj, normed)
+            qlinear_auto!(k_buf, layer.self_attn.k_proj, normed)
+            qlinear_auto!(v_buf, layer.self_attn.v_proj, normed)
+        end
 
         q_3d = reshape(q_buf, hd, n_q, seq_len)
         k_3d = reshape(k_buf, hd, n_kv, seq_len)
