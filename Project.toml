@@ -3,9 +3,13 @@ uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 
 [deps]
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
-Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
+Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+UnicodePlots = "b8865327-cd53-5732-bb35-84acbb429228"
+
+[compat]
+UnicodePlots = "3.8.2"
