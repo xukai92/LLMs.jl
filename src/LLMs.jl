@@ -26,6 +26,8 @@ include("metal/argmax.jl")
 include("metal/fused_mlp.jl")
 include("metal/flash_attention.jl")
 include("metal/fused_qkv.jl")
+include("metal/quantized_matmul_vec.jl")
+include("metal/fp16_matmul.jl")
 
 # Model definition and loading
 include("model.jl")
@@ -64,6 +66,7 @@ export metal_qmatmul_v4!
 export metal_fused_gate_up_swiglu!
 export metal_flash_attention!
 export metal_fused_qkv!
+export metal_qmatmul_vec!, metal_fp16_matmul!
 export metal_argmax_last_col, metal_argmax_last_col!
 
 # Phase 2 model exports
