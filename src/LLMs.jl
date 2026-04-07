@@ -17,6 +17,7 @@ include("metal/softmax.jl")
 include("metal/attention.jl")
 include("metal/quantized_matmul.jl")
 include("metal/elementwise.jl")
+include("metal/argmax.jl")
 
 # Model definition and loading
 include("model.jl")
@@ -44,6 +45,7 @@ export softmax_cpu!, metal_softmax!
 export attention_cpu!, metal_attention!
 export dequantize_cpu, quantized_matmul_cpu!, metal_quantized_matmul!
 export metal_add!
+export metal_argmax_last_col, metal_argmax_last_col!
 
 # Phase 2 model exports
 export LlamaConfig, LlamaModel, load_llama_model

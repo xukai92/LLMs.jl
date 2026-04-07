@@ -66,8 +66,6 @@ function forward_fast!(model::LlamaModel, token_ids::MtlVector{Int32},
     mlp_buf = sized(pool.mlp_out, h, seq_len)
 
     effective_seq = cache.seq_len + seq_len
-    k_contig = sized(pool.k_contig, hd, n_kv, effective_seq)
-    v_contig = sized(pool.v_contig, hd, n_kv, effective_seq)
     scores_buf = sized(pool.scores, n_q, seq_len, effective_seq)
     attn_out = sized(pool.attn_out_3d, hd, n_q, seq_len)
 
@@ -93,22 +91,24 @@ function forward_fast!(model::LlamaModel, token_ids::MtlVector{Int32},
         # Append to KV cache
         append_kv!(cache, layer_idx, k_3d, v_3d)
 
-        # Copy full KV from cache for attention
-        copyto!(k_contig, view(cache.k_cache[layer_idx], :, :, 1:effective_seq))
-        copyto!(v_contig, view(cache.v_cache[layer_idx], :, :, 1:effective_seq))
+        # Use cache arrays directly — they're contiguous MtlArrays,
+        # and the attention kernel only reads positions 1:effective_seq
+        # (controlled by the seq_kv parameter)
+        k_cache_layer = cache.k_cache[layer_idx]
+        v_cache_layer = cache.v_cache[layer_idx]
 
         # Attention
         scale = 1.0f0 / sqrt(Float32(hd))
         tg1 = min(effective_seq, 1024)
         tg1 = max(tg1 - (tg1 % 32), 32)
         @metal threads=tg1 groups=(n_q, seq_len) attn_scores_softmax_kernel!(
-            scores_buf, q_3d, k_contig,
+            scores_buf, q_3d, k_cache_layer,
             Int32(hd), Int32(n_kv), Int32(n_q ÷ n_kv), Int32(effective_seq),
             scale, Int32(cache.seq_len), Int32(1))
 
         tg2 = min(hd, 256)
         @metal threads=tg2 groups=(n_q, seq_len) attn_value_kernel!(
-            attn_out, scores_buf, v_contig,
+            attn_out, scores_buf, v_cache_layer,
             Int32(hd), Int32(n_kv), Int32(n_q ÷ n_kv), Int32(effective_seq))
 
         # O projection
@@ -172,9 +172,11 @@ function generate_fast(model::LlamaModel, prompt_ids::Vector{Int};
     # Prefill
     prompt_gpu = MtlArray(Int32.(prompt_ids))
     logits = forward_fast!(model, prompt_gpu, cache, pool)
-    Metal.synchronize()
 
-    next_token = argmax_last_col_cpu(logits)
+    # GPU argmax — only copies 4 bytes back instead of 256KB
+    argmax_buf = MtlArray(Int32[0])
+    metal_argmax_last_col!(argmax_buf, logits)
+    next_token = Array(argmax_buf)[1]
     push!(generated, Int(next_token))
 
     # For decode, we need a pool sized for B=1
@@ -186,17 +188,20 @@ function generate_fast(model::LlamaModel, prompt_ids::Vector{Int};
 
     # Pre-allocate single-token buffer for decode
     token_buf = MtlArray(Int32[0])
+    # Pre-allocate CPU-side readback for argmax (1 element)
+    argmax_host = Int32[0]
 
     for step in 1:max_tokens-1
-        if Int(next_token) in config.eos_token_ids
+        if next_token in config.eos_token_ids
             break
         end
 
         copyto!(token_buf, Int32[next_token])
         logits = forward_fast!(model, token_buf, cache, decode_pool)
-        Metal.synchronize()
-
-        next_token = argmax_last_col_cpu(logits)
+        metal_argmax_last_col!(argmax_buf, logits)
+        # Single 4-byte readback — implicit sync only for this tiny transfer
+        copyto!(argmax_host, argmax_buf)
+        next_token = argmax_host[1]
         push!(generated, Int(next_token))
     end
 

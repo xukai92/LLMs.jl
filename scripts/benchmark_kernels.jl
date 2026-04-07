@@ -274,53 +274,44 @@ end
 
 function bench_e2e_decode(model, tok; gen_lengths=[20, 50, 128])
     println("\n" * "="^80)
-    println("END-TO-END DECODE BENCHMARK")
+    println("END-TO-END DECODE BENCHMARK (forward_fast!)")
     println("="^80)
 
     prompt = "The quick brown fox jumps over the lazy dog. "^10  # ~100 tokens
     prompt_ids = encode(tok, prompt)
     println("Prompt: $(length(prompt_ids)) tokens\n")
 
+    # Warmup
+    generate_fast(model, prompt_ids; max_tokens=5)
+
     for gen_len in gen_lengths
-        # Warmup
-        cache = KVCache(model.config; max_seq_len=length(prompt_ids) + gen_len + 16)
-        prompt_gpu = MtlArray(Int32.(prompt_ids))
-        logits = forward(model, prompt_gpu, cache)
-        Metal.synchronize()
-
-        # Timed decode
         t0 = time()
-        # Prefill
-        cache2 = KVCache(model.config; max_seq_len=length(prompt_ids) + gen_len + 16)
-        prompt_gpu2 = MtlArray(Int32.(prompt_ids))
-        logits = forward(model, prompt_gpu2, cache2)
-        Metal.synchronize()
-        t_prefill = time() - t0
-
-        # Decode
-        t_decode_start = time()
-        next_token = argmax_last_col_cpu(logits)
-        for i in 2:gen_len
-            token_gpu = MtlArray(Int32[next_token])
-            logits = forward(model, token_gpu, cache2)
-            Metal.synchronize()
-            next_token = argmax_last_col_cpu(logits)
-        end
-        t_decode = time() - t_decode_start
+        gen = generate_fast(model, prompt_ids; max_tokens=gen_len)
         t_total = time() - t0
 
-        ttft = t_prefill
-        decode_tps = (gen_len - 1) / t_decode  # first token is from prefill
+        # Approximate TTFT (one prefill pass)
+        config = model.config
+        total_seq = length(prompt_ids) + gen_len + 16
+        cache = KVCache(config; max_seq_len=total_seq)
+        pool = BufferPool(config; max_batch=length(prompt_ids), max_seq=total_seq)
+        prompt_gpu = MtlArray(Int32.(prompt_ids))
+        t_pf = time()
+        forward_fast!(model, prompt_gpu, cache, pool)
+        Metal.synchronize()
+        t_prefill = time() - t_pf
+
+        decode_time = t_total - t_prefill
+        decode_tps = max(gen_len - 1, 1) / max(decode_time, 1e-9)
         overall_tps = gen_len / t_total
 
         @printf("  gen=%3d tokens: TTFT=%.3fs  decode=%.1f tok/s  overall=%.1f tok/s  (%.2fs total)\n",
-                gen_len, ttft, decode_tps, overall_tps, t_total)
+                gen_len, t_prefill, decode_tps, overall_tps, t_total)
     end
 end
 
 function bench_e2e_ttft(model, tok; prompt_lengths=[16, 128, 512])
     println("\n" * "="^80)
-    println("TTFT (Time To First Token) BENCHMARK")
+    println("TTFT (Time To First Token) BENCHMARK (forward_fast!)")
     println("="^80)
 
     base = "Hello world. "^200  # long base text
@@ -330,18 +321,22 @@ function bench_e2e_ttft(model, tok; prompt_lengths=[16, 128, 512])
         ids = base_ids[1:min(plen, length(base_ids))]
 
         # Warmup
-        cache = KVCache(model.config; max_seq_len=length(ids) + 16)
+        config = model.config
+        total_seq = length(ids) + 16
+        cache = KVCache(config; max_seq_len=total_seq)
+        pool = BufferPool(config; max_batch=length(ids), max_seq=total_seq)
         gpu_ids = MtlArray(Int32.(ids))
-        forward(model, gpu_ids, cache)
+        forward_fast!(model, gpu_ids, cache, pool)
         Metal.synchronize()
 
         # Timed
         t0 = time()
-        cache2 = KVCache(model.config; max_seq_len=length(ids) + 16)
+        cache2 = KVCache(config; max_seq_len=total_seq)
+        pool2 = BufferPool(config; max_batch=length(ids), max_seq=total_seq)
         gpu_ids2 = MtlArray(Int32.(ids))
-        logits = forward(model, gpu_ids2, cache2)
+        logits = forward_fast!(model, gpu_ids2, cache2, pool2)
         Metal.synchronize()
-        _ = argmax_last_col_cpu(logits)
+        _ = metal_argmax_last_col(logits)
         ttft = time() - t0
 
         tps = length(ids) / ttft
