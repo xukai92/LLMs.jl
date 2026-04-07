@@ -153,9 +153,9 @@ function forward_opt!(model::LlamaModel, token_ids::MtlVector{Int32},
         # Saves 1 add dispatch + 1 rmsnorm read (reads x once instead of twice)
         metal_rmsnorm_residual!(normed, x, o_buf, layer.post_attention_layernorm, dc.eps)
 
-        qlinear_auto!(gate_buf, layer.mlp.gate_proj, normed)
-        qlinear_auto!(up_buf, layer.mlp.up_proj, normed)
-        metal_swiglu!(swiglu_buf, gate_buf, up_buf)
+        # Fused gate + up + SwiGLU: 3 dispatches → 1
+        metal_fused_gate_up_swiglu!(swiglu_buf, normed,
+                                     layer.mlp.gate_proj, layer.mlp.up_proj)
         qlinear_auto!(mlp_buf, layer.mlp.down_proj, swiglu_buf)
         # For the last op, we can't easily fuse the add into the next layer's rmsnorm
         # because the next layer uses a different weight vector. But we can fuse for
