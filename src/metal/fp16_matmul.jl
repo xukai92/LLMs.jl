@@ -406,21 +406,16 @@ function fp16_matmul_4x4_k8_ptr!(out, W, x, M::Int32, N::Int32, K::Int32)
     end; return nothing
 end
 
-"""FP16 matmul with auto kernel selection. Assumes padded inputs for B≥32."""
+"""
+FP16 matmul: `out[M,N] = W[M,K] * x[K,N]` using 4×4 simdgroup tiling.
+
+Always uses the ptr+vec2 kernel (fastest at all batch sizes).
+**Requires** M, K, N to be padded to multiples of 32. For small N (< 32),
+pad x and out to 32 columns at allocation time — runtime padding is too expensive.
+"""
 function metal_fp16_matmul!(out, W, x)
     M = Int32(size(W, 1)); K = Int32(size(W, 2)); N = Int32(size(x, 2))
-    if N >= 32
-        # Pointer+vec2 4×4 K×8: best for B≥32 (requires padded M,N,K)
-        @metal threads=512 groups=(cld(Int(M), 32), cld(Int(N), 32)) fp16_matmul_4x4_k8_ptr!(
-            out, W, x, M, N, K)
-    elseif N >= 16
-        # K×2 unrolled 2×2
-        @metal threads=128 groups=(cld(Int(M), 16), cld(Int(N), 16)) fp16_matmul_2x2_k2!(
-            out, W, x, M, N, K)
-    else
-        # 1-SG
-        @metal threads=32 groups=(cld(Int(M), 8), cld(Int(N), 8)) fp16_matmul_1sg!(
-            out, W, x, M, N, K)
-    end
+    @metal threads=512 groups=(cld(Int(M), 32), cld(Int(N), 32)) fp16_matmul_4x4_k8_ptr!(
+        out, W, x, M, N, K)
     return out
 end
