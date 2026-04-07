@@ -52,7 +52,7 @@ export LlamaConfig, LlamaModel, load_llama_model
 export KVCache, append_kv!, get_kv, reset!
 export forward, generate, argmax_last_col_cpu
 export Tokenizer, encode, decode, encode_chat
-export BufferPool, forward_fast!, generate_fast
+export BufferPool, forward_fast!, generate_fast, sized
 
 # Phase 3 prefix cache exports
 export PrefixCache, prefix_match, insert_prefix!, restore_kv!
