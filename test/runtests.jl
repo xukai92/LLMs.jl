@@ -4,4 +4,5 @@ using Test
     include("test_safetensors.jl")
     include("test_metal_smoke.jl")
     include("test_kernels.jl")
+    include("test_prefix_cache.jl")
 end

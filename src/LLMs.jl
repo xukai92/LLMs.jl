@@ -24,6 +24,9 @@ include("kvcache.jl")
 include("forward.jl")
 include("tokenizer.jl")
 
+# Prefix cache
+include("prefix_cache.jl")
+
 # Phase 0 exports
 export load_safetensors, load_safetensors_lazy, SafeTensorInfo
 export vector_add!, metal_vector_add!
@@ -42,5 +45,9 @@ export LlamaConfig, LlamaModel, load_llama_model
 export KVCache, append_kv!, get_kv, reset!
 export forward, generate
 export Tokenizer, encode, decode, encode_chat
+
+# Phase 3 prefix cache exports
+export PrefixCache, prefix_match, insert_prefix!, restore_kv!
+export generate_with_cache
 
 end # module LLMs
