@@ -37,14 +37,18 @@ julia --project=. scripts/serve.jl
 
 All benchmarks on M3 Max.
 
-### End-to-end generation (Llama-3.2-3B-Instruct-4bit)
+### End-to-end throughput (Llama-3.2-3B-Instruct-4bit)
 
 | | Julia | MLX | Julia/MLX |
 |-|-------|-----|-----------|
-| Decode throughput | 20 tok/s | 167 tok/s | 0.12x |
-| TTFT (102 tokens) | ~0.5s | 0.08s | ~6x |
+| Decode (B=1) | 36 tok/s | 171 tok/s | 0.21x |
+| Prefill (B=16) | 156 tok/s | 658 tok/s | 0.24x |
+| Prefill (B=64) | 288 tok/s | 1622 tok/s | 0.18x |
+| Prefill (B=128) | 294 tok/s | 1726 tok/s | 0.17x |
 
-The e2e gap is larger than kernel-level due to per-dispatch overhead (~30us per `@metal` call x ~280 dispatches per token). See [#5] and [#10] for planned improvements.
+The e2e gap (~4-6x) comes from two sources:
+1. **Per-dispatch overhead**: ~310 `@metal` calls per token × ~19μs each = ~6ms constant overhead (see [#5])
+2. **Kernel gap**: ~1.7x per matmul (load instruction overhead in compiled IR), compounding across 196 matmuls per forward pass
 
 ### Kernel microbenchmarks (3072x3072)
 
