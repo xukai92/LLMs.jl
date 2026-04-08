@@ -41,6 +41,7 @@ include("tokenizer.jl")
 include("buffer_pool.jl")
 include("forward_fast.jl")
 include("forward_optimized.jl")
+include("forward_fp16.jl")
 include("batched_dispatch.jl")
 include("metal_batch.jl")
 
@@ -80,6 +81,7 @@ export forward, generate, argmax_last_col_cpu
 export Tokenizer, encode, decode, encode_chat
 export BufferPool, forward_fast!, generate_fast, sized
 export DispatchConfig, forward_opt!, generate_opt
+export FP16Linear, FP16Layer, FP16Model, to_fp16, forward_fp16!, fp16_linear!
 export BatchedCommandBuffer, begin_encoding!, encode!, submit!, wait!
 export MetalBatch, open!, dispatch!, close_and_commit!
 
