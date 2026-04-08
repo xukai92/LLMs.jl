@@ -72,9 +72,16 @@ end
 
 """Get a view of the buffer sized to the current batch/seq dimensions."""
 function sized(buf::MtlMatrix{T}, rows::Int, cols::Int) where T
-    return view(buf, 1:rows, 1:cols)
+    # Use : for dimensions that match the buffer to avoid SubArray
+    # (view(:, 1:N) returns MtlMatrix, view(1:M, 1:N) returns SubArray)
+    r = rows == size(buf, 1) ? Colon() : (1:rows)
+    c = cols == size(buf, 2) ? Colon() : (1:cols)
+    return view(buf, r, c)
 end
 
 function sized(buf::MtlArray{T, 3}, d1::Int, d2::Int, d3::Int) where T
-    return view(buf, 1:d1, 1:d2, 1:d3)
+    r1 = d1 == size(buf, 1) ? Colon() : (1:d1)
+    r2 = d2 == size(buf, 2) ? Colon() : (1:d2)
+    r3 = d3 == size(buf, 3) ? Colon() : (1:d3)
+    return view(buf, r1, r2, r3)
 end
