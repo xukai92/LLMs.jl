@@ -163,6 +163,9 @@ struct FP16Layer
     gate_proj::FP16Linear
     up_proj::FP16Linear
     down_proj::FP16Linear
+    # Fused weights (pre-concatenated at load time)
+    qkv_proj::FP16Linear      # Q+K+V fused: (q_dim+k_dim+v_dim, in_features)
+    gate_up_proj::FP16Linear   # gate+up fused: (2*intermediate, in_features)
 end
 
 struct FP16Model
@@ -181,15 +184,36 @@ function to_fp16(model::LlamaModel)
     layers = FP16Layer[]
     for (i, l) in enumerate(model.layers)
         print("  Layer $i/$(length(model.layers))\r")
+        q = dequantize_linear(l.self_attn.q_proj)
+        k = dequantize_linear(l.self_attn.k_proj)
+        v = dequantize_linear(l.self_attn.v_proj)
+        gate = dequantize_linear(l.mlp.gate_proj)
+        up = dequantize_linear(l.mlp.up_proj)
+
+        # Fuse QKV: concatenate weight matrices along output dim
+        qkv_out = q.out_features + k.out_features + v.out_features
+        qkv_out_pad = cld(qkv_out, 32) * 32
+        qkv_w = zeros(Float16, qkv_out_pad, q.in_features)
+        qkv_w[1:q.out_features, :] = Array(q.weight)[1:q.out_features, :]
+        qkv_w[q.out_features+1:q.out_features+k.out_features, :] = Array(k.weight)[1:k.out_features, :]
+        qkv_w[q.out_features+k.out_features+1:qkv_out, :] = Array(v.weight)[1:v.out_features, :]
+        qkv = FP16Linear(MtlArray(qkv_w), qkv_out, q.in_features)
+
+        # Fuse gate+up: concatenate along output dim
+        gu_out = gate.out_features + up.out_features
+        gu_out_pad = cld(gu_out, 32) * 32
+        gu_w = zeros(Float16, gu_out_pad, gate.in_features)
+        gu_w[1:gate.out_features, :] = Array(gate.weight)[1:gate.out_features, :]
+        gu_w[gate.out_features+1:gu_out, :] = Array(up.weight)[1:up.out_features, :]
+        gate_up = FP16Linear(MtlArray(gu_w), gu_out, gate.in_features)
+
         push!(layers, FP16Layer(
             l.input_layernorm, l.post_attention_layernorm,
-            dequantize_linear(l.self_attn.q_proj),
-            dequantize_linear(l.self_attn.k_proj),
-            dequantize_linear(l.self_attn.v_proj),
+            q, k, v,
             dequantize_linear(l.self_attn.o_proj),
-            dequantize_linear(l.mlp.gate_proj),
-            dequantize_linear(l.mlp.up_proj),
+            gate, up,
             dequantize_linear(l.mlp.down_proj),
+            qkv, gate_up,
         ))
     end
     println("  Done.                    ")
@@ -230,17 +254,23 @@ function forward_fp16!(model::FP16Model, token_ids::MtlVector{Int32},
 
     start_pos = cache.seq_len + 1
 
+    # Pre-allocate fused QKV output buffer
+    qkv_dim = n_q * hd + n_kv * hd + n_kv * hd
+    qkv_buf = MtlArray(zeros(Float16, cld(qkv_dim, 32) * 32, seq_len))
+    # Pre-allocate fused gate+up output buffer
+    gu_dim = inter * 2
+    gu_buf = MtlArray(zeros(Float16, cld(gu_dim, 32) * 32, seq_len))
+
     for (layer_idx, layer) in enumerate(model.layers)
         metal_rmsnorm!(normed, x, layer.input_layernorm, dc.eps)
 
-        # Q, K, V projections — use fwd kernel (handles SubArray x)
-        fp16_linear!(q_buf, layer.q_proj, normed)
-        fp16_linear!(k_buf, layer.k_proj, normed)
-        fp16_linear!(v_buf, layer.v_proj, normed)
+        # Fused QKV: one matmul instead of 3, read directly from output
+        fp16_linear!(qkv_buf, layer.qkv_proj, normed)
+        q_dim = n_q * hd; k_dim = n_kv * hd
 
-        q_3d = reshape(q_buf, hd, n_q, seq_len)
-        k_3d = reshape(k_buf, hd, n_kv, seq_len)
-        v_3d = reshape(v_buf, hd, n_kv, seq_len)
+        q_3d = reshape(view(qkv_buf, 1:q_dim, :), hd, n_q, seq_len)
+        k_3d = reshape(view(qkv_buf, q_dim+1:q_dim+k_dim, :), hd, n_kv, seq_len)
+        v_3d = reshape(view(qkv_buf, q_dim+k_dim+1:q_dim+2*k_dim, :), hd, n_kv, seq_len)
 
         metal_rope!(q_3d, model.cos_table, model.sin_table, start_pos)
         metal_rope!(k_3d, model.cos_table, model.sin_table, start_pos)
@@ -253,10 +283,9 @@ function forward_fp16!(model::FP16Model, token_ids::MtlVector{Int32},
         fp16_linear!(o_buf, layer.o_proj, reshape(attn_out, h, seq_len))
         metal_rmsnorm_residual!(normed, x, o_buf, layer.post_attention_layernorm, dc.eps)
 
-        # MLP
-        fp16_linear!(gate_buf, layer.gate_proj, normed)
-        fp16_linear!(up_buf, layer.up_proj, normed)
-        metal_swiglu!(swiglu_buf, gate_buf, up_buf)
+        # Fused gate+up: one matmul instead of 2, then swiglu on slices
+        fp16_linear!(gu_buf, layer.gate_up_proj, normed)
+        metal_swiglu!(swiglu_buf, view(gu_buf, 1:inter, :), view(gu_buf, inter+1:2*inter, :))
         fp16_linear!(mlp_buf, layer.down_proj, swiglu_buf)
         metal_add!(x, mlp_buf)
     end
