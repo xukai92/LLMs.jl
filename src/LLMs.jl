@@ -5,8 +5,9 @@ using KernelAbstractions
 using JSON3
 using Mmap
 
-# GPUCompiler patch deferred to __init__ (method overwriting not allowed during precompile)
+# Patches deferred to __init__ (method overwriting not allowed during precompile)
 include("gpucompiler_patch.jl")
+include("metal_batch_context.jl")
 
 # Safetensors weight loading
 include("safetensors.jl")
@@ -82,6 +83,8 @@ export Tokenizer, encode, decode, encode_chat
 export BufferPool, forward_fast!, generate_fast, sized
 export DispatchConfig, forward_opt!, generate_opt
 export FP16Linear, FP16Layer, FP16Model, to_fp16, forward_fp16!, fp16_linear!
+const with_metal_batch = MetalBatchContext.with_metal_batch
+export with_metal_batch
 export BatchedCommandBuffer, begin_encoding!, encode!, submit!, wait!
 export MetalBatch, open!, dispatch!, close_and_commit!
 
@@ -94,6 +97,7 @@ export serve, InferenceEngine, apply_chat_template
 
 function __init__()
     GPUCompilerPatch.apply!()
+    MetalBatchContext.apply_patch!()
 end
 
 end # module LLMs

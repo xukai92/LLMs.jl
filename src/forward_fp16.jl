@@ -44,6 +44,20 @@ function dequantize_linear(ql::QuantizedLinear)
     end
 end
 
+"""Pre-allocated padded buffers for FP16 forward pass, avoiding SubArray views."""
+struct FP16BufferPool
+    bufs::Dict{Tuple{Int,Int}, MtlMatrix{Float16}}
+end
+FP16BufferPool() = FP16BufferPool(Dict{Tuple{Int,Int}, MtlMatrix{Float16}}())
+
+function get_padded!(pool::FP16BufferPool, rows::Int, cols::Int)
+    rp = cld(rows, 32) * 32; cp = cld(cols, 32) * 32
+    key = (rp, cp)
+    get!(pool.bufs, key) do
+        MtlArray(zeros(Float16, rp, cp))
+    end
+end
+
 const _F16x2_fwd = NTuple{2, VecElement{Float16}}
 
 # FP16 matmul kernel for forward pass: pointer() for W (padded MtlArray),
@@ -115,10 +129,25 @@ function fp16_matmul_fwd!(out, W, x, M::Int32, N::Int32, K::Int32)
         end; end; return nothing
 end
 
+"""Unwrap SubArray/ReshapedArray to parent MtlArray if the view covers the full extent."""
+@inline _unwrap(x::MtlMatrix) = x
+@inline function _unwrap(x::SubArray)
+    p = parent(x)
+    size(x) == size(p) && p isa MtlMatrix{Float16} ? p : x
+end
+@inline _unwrap(x) = x  # fallback for ReshapedArray etc
+
 function fp16_linear!(out, layer::FP16Linear, x)
-    M = Int32(layer.out_features); K = Int32(layer.in_features); N = Int32(size(x, 2))
-    @metal threads=512 groups=(cld(Int(M), 32), cld(Int(N), 32)) fp16_matmul_fwd!(
-        out, layer.weight, x, M, N, K)
+    # Try to unwrap SubArray views to get the fast ptr+vec2 kernel
+    x_raw = _unwrap(x); out_raw = _unwrap(out)
+    if x_raw isa MtlMatrix{Float16} && out_raw isa MtlMatrix{Float16}
+        metal_fp16_matmul!(out_raw, layer.weight, x_raw)
+    else
+        # Fallback: array indexing kernel for non-trivial views
+        M = Int32(layer.out_features); K = Int32(layer.in_features); N = Int32(size(x, 2))
+        @metal threads=512 groups=(cld(Int(M), 32), cld(Int(N), 32)) fp16_matmul_fwd!(
+            out, layer.weight, x, M, N, K)
+    end
     return out
 end
 
@@ -187,6 +216,7 @@ function forward_fp16!(model::FP16Model, token_ids::MtlVector{Int32},
         copyto!(view(x, :, i), view(model.embed_table, :, tid))
     end
 
+    # Use sized views for non-matmul ops (rmsnorm, rope, attention, add)
     normed = sized(pool.normed, h, seq_len)
     q_buf = sized(pool.q, n_q * hd, seq_len)
     k_buf = sized(pool.k, n_kv * hd, seq_len)
@@ -203,7 +233,7 @@ function forward_fp16!(model::FP16Model, token_ids::MtlVector{Int32},
     for (layer_idx, layer) in enumerate(model.layers)
         metal_rmsnorm!(normed, x, layer.input_layernorm, dc.eps)
 
-        # Q, K, V projections using FP16 matmul
+        # Q, K, V projections — use fwd kernel (handles SubArray x)
         fp16_linear!(q_buf, layer.q_proj, normed)
         fp16_linear!(k_buf, layer.k_proj, normed)
         fp16_linear!(v_buf, layer.v_proj, normed)
