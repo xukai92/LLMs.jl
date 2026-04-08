@@ -37,18 +37,24 @@ julia --project=. scripts/serve.jl
 
 All benchmarks on M3 Max.
 
-### End-to-end throughput (Llama-3.2-3B-Instruct-4bit)
+### End-to-end throughput (Llama-3.2-3B, M3 Max)
+
+**FP16 (dequantized weights):**
 
 | | Julia | MLX | Julia/MLX |
 |-|-------|-----|-----------|
-| Decode (B=1) | 36 tok/s | 171 tok/s | 0.21x |
-| Prefill (B=16) | 156 tok/s | 658 tok/s | 0.24x |
-| Prefill (B=64) | 288 tok/s | 1622 tok/s | 0.18x |
-| Prefill (B=128) | 294 tok/s | 1726 tok/s | 0.17x |
+| Prefill (B=32) | 432 tok/s | 848 tok/s | 0.51x |
+| Prefill (B=64) | 516 tok/s | 1365 tok/s | 0.38x |
 
-The e2e gap (~4-6x) comes from two sources:
-1. **Per-dispatch overhead**: ~310 `@metal` calls per token × ~19μs each = ~6ms constant overhead (see [#5])
-2. **Kernel gap**: ~1.7x per matmul (load instruction overhead in compiled IR), compounding across 196 matmuls per forward pass
+**4-bit quantized:**
+
+| | Julia | MLX | Julia/MLX |
+|-|-------|-----|-----------|
+| Decode (B=1) | 37 tok/s | 137 tok/s | 0.27x |
+| Prefill (B=32) | 359 tok/s | 1299 tok/s | 0.28x |
+| Prefill (B=64) | 409 tok/s | 1615 tok/s | 0.25x |
+
+FP16 gap is ~2x at B=32 (our FP16 kernel matches MLX per-matmul). Quantized gap is ~4x (1.7x kernel gap + infrastructure). See [#12] for closing the kernel gap via `threadgroup_async_copy`.
 
 ### Kernel microbenchmarks (3072x3072)
 
