@@ -43,8 +43,8 @@ All benchmarks on M3 Max.
 
 | | Julia | MLX | Julia/MLX |
 |-|-------|-----|-----------|
-| Prefill (B=32) | 432 tok/s | 848 tok/s | 0.51x |
-| Prefill (B=64) | 516 tok/s | 1365 tok/s | 0.38x |
+| Prefill (B=32) | 464 tok/s | 848 tok/s | 0.55x |
+| Prefill (B=64) | ~520 tok/s | 1365 tok/s | 0.38x |
 
 **4-bit quantized:**
 
@@ -54,7 +54,7 @@ All benchmarks on M3 Max.
 | Prefill (B=32) | 359 tok/s | 1299 tok/s | 0.28x |
 | Prefill (B=64) | 409 tok/s | 1615 tok/s | 0.25x |
 
-FP16 gap is ~2x at B=32 (our FP16 kernel matches MLX per-matmul). Quantized gap is ~4x (1.7x kernel gap + infrastructure). See [#12] for closing the kernel gap via `threadgroup_async_copy`.
+FP16 gap is ~1.8x at B=32 (our kernel matches MLX per-matmul, remaining gap is infrastructure). See [#12] for closing the kernel gap via `threadgroup_async_copy`.
 
 ### Kernel microbenchmarks (3072x3072)
 
