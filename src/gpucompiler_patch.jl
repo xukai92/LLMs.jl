@@ -1,96 +1,75 @@
 """
     gpucompiler_patch.jl — Monkey-patch GPUCompiler.jl to enable trap elimination on macOS 15+
 
-## Problem
-GPUCompiler.jl's `finish_ir!` for Metal has a `replace_unreachable!` pass that removes trap
-instructions from GPU IR, but it's gated behind `macos < v"15"`. On macOS 15+, all
-`check_sign_bit` calls generate `icmp → br → trap → unreachable` patterns that remain in
-the final Metal IR — 323 trap instructions per kernel for our FP16 matmul.
-
-## Fix
-Override `GPUCompiler.finish_ir!` for MetalCompilerTarget to always run `replace_unreachable!`
-regardless of macOS version, plus a SimplifyCFG cleanup pass to fold dead branches.
-
-## Impact
-- IR traps: 323 → 0
-- B=2-8:  20-42% faster (trap overhead was large fraction of runtime)
-- B=32:   10% faster (now 0.90x MLX, was 1.04x)
-- B≥128:  no change (memory-bound)
-
-## How to apply upstream
-File as GPUCompiler.jl PR: remove the `macos < v"15"` gate in `finish_ir!` (metal.jl ~line 180).
+Must be applied at runtime via `__init__` (method overwriting not allowed during precompile).
 """
 module GPUCompilerPatch
 
-using Metal
+function apply!()
+    GC = Base.loaded_modules[Base.PkgId(
+        Base.UUID("61eb1bfa-7361-4325-ad38-22787b887f55"), "GPUCompiler")]
+    LLVM = GC.LLVM
 
-# Access GPUCompiler through Metal's dependency
-const GC = Base.loaded_modules[Base.PkgId(
-    Base.UUID("61eb1bfa-7361-4325-ad38-22787b887f55"), "GPUCompiler")]
+    @eval function $GC.finish_ir!(job::$GC.CompilerJob{$GC.MetalCompilerTarget},
+                                   mod::$LLVM.Module, entry::$LLVM.Function)
+        if job.config.kernel && $GC.kernel_state_type(job) !== Nothing
+            entry = $GC.kernel_state_to_reference!(job, mod, entry)
+        end
+        if job.config.kernel
+            entry = $GC.add_parameter_address_spaces!(job, mod, entry)
+            entry = $GC.add_global_address_spaces!(job, mod, entry)
+            $GC.add_argument_metadata!(job, mod, entry)
+            $GC.add_module_metadata!(job, mod)
+        end
+        $GC.hide_noreturn!(mod)
 
-using .GC: CompilerJob, MetalCompilerTarget, kernel_state_type,
-    kernel_state_to_reference!, add_parameter_address_spaces!,
-    add_global_address_spaces!, add_argument_metadata!, add_module_metadata!,
-    hide_noreturn!, replace_unreachable!, lower_llvm_intrinsics!
-
-using .GC.LLVM: Module, Function, functions, name, @dispose, add!, run!,
-    NewPMPassBuilder, NewPMFunctionPassManager, SimplifyCFGPass, InstCombinePass,
-    AlwaysInlinerPass, ModulePassManager, expand_reductions!, has_oldpm
-
-# Override finish_ir! to remove the macOS 15 gate on replace_unreachable!
-function GC.finish_ir!(@nospecialize(job::CompilerJob{MetalCompilerTarget}),
-                       mod::Module, entry::Function)
-    if job.config.kernel && kernel_state_type(job) !== Nothing
-        entry = kernel_state_to_reference!(job, mod, entry)
-    end
-
-    if job.config.kernel
-        entry = add_parameter_address_spaces!(job, mod, entry)
-        entry = add_global_address_spaces!(job, mod, entry)
-        add_argument_metadata!(job, mod, entry)
-        add_module_metadata!(job, mod)
-    end
-
-    hide_noreturn!(mod)
-
-    # PATCHED: always run replace_unreachable! (removed macOS < 15 gate)
-    any_replaced = false
-    for f in functions(mod)
-        any_replaced |= replace_unreachable!(job, f)
-    end
-    if any_replaced
-        @dispose pb=NewPMPassBuilder() begin
-            add!(pb, NewPMFunctionPassManager()) do fpm
-                add!(fpm, SimplifyCFGPass())
-                add!(fpm, InstCombinePass())
+        any_replaced = false
+        for f in $LLVM.functions(mod)
+            any_replaced |= $GC.replace_unreachable!(job, f)
+        end
+        if any_replaced
+            pb = $LLVM.NewPMPassBuilder()
+            try
+                fpm = $LLVM.NewPMFunctionPassManager()
+                $LLVM.add!(fpm, $LLVM.SimplifyCFGPass())
+                $LLVM.add!(fpm, $LLVM.InstCombinePass())
+                $LLVM.add!(pb, fpm)
+                $LLVM.run!(pb, mod)
+            finally
+                $LLVM.dispose(pb)
             end
-            run!(pb, mod)
         end
-    end
 
-    changed = false
-    for f in functions(mod)
-        changed |= lower_llvm_intrinsics!(job, f)
-    end
-    if changed
-        @dispose pb=NewPMPassBuilder() begin
-            add!(pb, AlwaysInlinerPass())
-            add!(pb, NewPMFunctionPassManager()) do fpm
-                add!(fpm, SimplifyCFGPass())
-                add!(fpm, InstCombinePass())
+        changed = false
+        for f in $LLVM.functions(mod)
+            changed |= $GC.lower_llvm_intrinsics!(job, f)
+        end
+        if changed
+            pb = $LLVM.NewPMPassBuilder()
+            try
+                $LLVM.add!(pb, $LLVM.AlwaysInlinerPass())
+                fpm = $LLVM.NewPMFunctionPassManager()
+                $LLVM.add!(fpm, $LLVM.SimplifyCFGPass())
+                $LLVM.add!(fpm, $LLVM.InstCombinePass())
+                $LLVM.add!(pb, fpm)
+                $LLVM.run!(pb, mod)
+            finally
+                $LLVM.dispose(pb)
             end
-            run!(pb, mod)
         end
-    end
 
-    if has_oldpm()
-        @dispose pm=ModulePassManager() begin
-            expand_reductions!(pm)
-            run!(pm, mod)
+        if $LLVM.has_oldpm()
+            pm = $LLVM.ModulePassManager()
+            try
+                $LLVM.expand_reductions!(pm)
+                $LLVM.run!(pm, mod)
+            finally
+                $LLVM.dispose(pm)
+            end
         end
-    end
 
-    return entry
+        return entry
+    end
 end
 
 end # module

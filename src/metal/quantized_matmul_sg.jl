@@ -58,14 +58,12 @@ function qmatmul_sg_kernel!(out, x, packed, scales, biases,
             @inbounds w_dst[row_in_tile, 7] = s * Float32((pv >> UInt32(24)) & UInt32(0xF)) + bi
             @inbounds w_dst[row_in_tile, 8] = s * Float32((pv >> UInt32(28)) & UInt32(0xF)) + bi
         elseif gtid <= Int32(160)
-            # x: vec2 Float16 loads
+            # x: load 2 elements per thread
             f = gtid - Int32(33); pair = f % Int32(4); c = (f ÷ Int32(4)) + Int32(1)
             r1 = pair * Int32(2) + Int32(1)
             gk = k_base + r1; gn = (tile_b - Int32(1)) * Int32(32) + c
-            p = pointer(x) + (Int64(gn - Int32(1)) * Int64(I) + Int64(gk - Int32(1))) * Int64(2)
-            vec = unsafe_load(reinterpret(Core.LLVMPtr{_QF16x2, Metal.AS.Device}, p))
-            @inbounds x_dst[r1, c] = Float32(vec[1].value)
-            @inbounds x_dst[r1 + Int32(1), c] = Float32(vec[2].value)
+            @inbounds x_dst[r1, c] = Float32(x[gk, gn])
+            @inbounds x_dst[r1 + Int32(1), c] = Float32(x[gk + Int32(1), gn])
         end
     end
 

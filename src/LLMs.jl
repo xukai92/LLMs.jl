@@ -5,8 +5,8 @@ using KernelAbstractions
 using JSON3
 using Mmap
 
-# Patches for Metal.jl and GPUCompiler.jl (must be loaded before kernels)
-include("gpucompiler_patch.jl")  # trap elimination on macOS 15+
+# GPUCompiler patch deferred to __init__ (method overwriting not allowed during precompile)
+include("gpucompiler_patch.jl")
 
 # Safetensors weight loading
 include("safetensors.jl")
@@ -31,6 +31,7 @@ include("metal/flash_attention.jl")
 include("metal/fused_qkv.jl")
 include("metal/quantized_matmul_vec.jl")
 include("metal/fp16_matmul.jl")
+include("metal/quantized_matmul_sg.jl")
 
 # Model definition and loading
 include("model.jl")
@@ -88,5 +89,9 @@ export generate_with_cache
 
 # Phase 4 server exports
 export serve, InferenceEngine, apply_chat_template
+
+function __init__()
+    GPUCompilerPatch.apply!()
+end
 
 end # module LLMs

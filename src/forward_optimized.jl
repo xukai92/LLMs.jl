@@ -18,8 +18,14 @@ into the kernel dispatch, reducing per-call argument count.
 
 """Quantized linear with best-available kernel per batch size."""
 function qlinear_auto!(out, layer::QuantizedLinear, x)
-    metal_qmatmul_v2!(out, x, layer.weight, layer.scales, layer.biases;
-                        group_size=layer.group_size)
+    B = size(x, 2)
+    if B >= 16
+        metal_qmatmul_sg!(out, x, layer.weight, layer.scales, layer.biases;
+                           group_size=layer.group_size)
+    else
+        metal_qmatmul_v2!(out, x, layer.weight, layer.scales, layer.biases;
+                           group_size=layer.group_size)
+    end
     return out
 end
 
