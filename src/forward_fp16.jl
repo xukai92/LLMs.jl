@@ -272,8 +272,7 @@ function forward_fp16!(model::FP16Model, token_ids::MtlVector{Int32},
         k_3d = reshape(view(qkv_buf, q_dim+1:q_dim+k_dim, :), hd, n_kv, seq_len)
         v_3d = reshape(view(qkv_buf, q_dim+k_dim+1:q_dim+2*k_dim, :), hd, n_kv, seq_len)
 
-        metal_rope!(q_3d, model.cos_table, model.sin_table, start_pos)
-        metal_rope!(k_3d, model.cos_table, model.sin_table, start_pos)
+        metal_rope_qk!(q_3d, k_3d, model.cos_table, model.sin_table, start_pos)
         append_kv!(cache, layer_idx, k_3d, v_3d)
 
         metal_flash_attention!(attn_out, q_3d, cache.k_cache[layer_idx],

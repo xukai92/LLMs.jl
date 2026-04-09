@@ -138,3 +138,50 @@ function metal_rope!(x, cos_table, sin_table, start_pos::Int)
         x, cos_table, sin_table, Int32(start_pos), Int32(half))
     return x
 end
+
+# ── Fused Q+K RoPE (single dispatch instead of two) ──
+
+function rope_qk_kernel!(q, k, cos_table, sin_table, start_pos::Int32,
+                          half_dim::Int32, n_q::Int32, n_kv::Int32)
+    pos_in_grid = thread_position_in_grid()
+    i = pos_in_grid.x     # pair index (1..half_dim)
+    h = pos_in_grid.y     # head index (covers max(n_q, n_kv))
+    s = pos_in_grid.z     # sequence position
+
+    if i > half_dim; return nothing; end
+    pos = start_pos + Int32(s) - Int32(1)
+    @inbounds c  = cos_table[i, pos]
+    @inbounds sn = sin_table[i, pos]
+
+    # Process Q head
+    if Int32(h) <= n_q
+        @inbounds x1 = Float32(q[2*i-1, h, s])
+        @inbounds x2 = Float32(q[2*i, h, s])
+        @inbounds q[2*i-1, h, s] = typeof(q[1,1,1])(x1 * c - x2 * sn)
+        @inbounds q[2*i, h, s]   = typeof(q[1,1,1])(x1 * sn + x2 * c)
+    end
+    # Process K head (same cos/sin, different head count)
+    if Int32(h) <= n_kv
+        @inbounds x1 = Float32(k[2*i-1, h, s])
+        @inbounds x2 = Float32(k[2*i, h, s])
+        @inbounds k[2*i-1, h, s] = typeof(k[1,1,1])(x1 * c - x2 * sn)
+        @inbounds k[2*i, h, s]   = typeof(k[1,1,1])(x1 * sn + x2 * c)
+    end
+    return nothing
+end
+
+"""Apply RoPE to both Q and K in a single dispatch."""
+function metal_rope_qk!(q, k, cos_table, sin_table, start_pos::Int)
+    head_dim, n_q, seq_len = size(q)
+    _, n_kv, _ = size(k)
+    half = head_dim ÷ 2
+    n_heads_max = max(n_q, n_kv)
+
+    threads_per_group = (min(half, 64), 1, 1)
+    groups = (cld(half, threads_per_group[1]), n_heads_max, seq_len)
+
+    @metal threads=threads_per_group groups=groups rope_qk_kernel!(
+        q, k, cos_table, sin_table, Int32(start_pos),
+        Int32(half), Int32(n_q), Int32(n_kv))
+    return q, k
+end

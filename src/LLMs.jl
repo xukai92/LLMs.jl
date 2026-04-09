@@ -58,7 +58,7 @@ export vector_add!, metal_vector_add!
 
 # Phase 1 kernel exports
 export rmsnorm_cpu!, metal_rmsnorm!, metal_rmsnorm_residual!
-export compute_rope_freqs, rope_cpu!, metal_rope!
+export compute_rope_freqs, rope_cpu!, metal_rope!, metal_rope_qk!
 export swiglu_cpu!, metal_swiglu!
 export softmax_cpu!, metal_softmax!
 export attention_cpu!, metal_attention!
