@@ -261,10 +261,14 @@ function forward_fp16!(model::FP16Model, token_ids::MtlVector{Int32},
     gu_dim = inter * 2
     gu_buf = MtlArray(zeros(Float16, cld(gu_dim, 32) * 32, seq_len))
 
-    for (layer_idx, layer) in enumerate(model.layers)
-        metal_rmsnorm!(normed, x, layer.input_layernorm, dc.eps)
+    n_layers = length(model.layers)
+    # First layer: standalone rmsnorm (no previous MLP residual to fuse)
+    metal_rmsnorm!(normed, x, model.layers[1].input_layernorm, dc.eps)
 
-        # Fused QKV: one matmul instead of 3, read directly from output
+    for (layer_idx, layer) in enumerate(model.layers)
+        # normed is ready (either from standalone rmsnorm or fused add+rmsnorm)
+
+        # Fused QKV: one matmul instead of 3
         fp16_linear!(qkv_buf, layer.qkv_proj, normed)
         q_dim = n_q * hd; k_dim = n_kv * hd
 
@@ -272,22 +276,29 @@ function forward_fp16!(model::FP16Model, token_ids::MtlVector{Int32},
         k_3d = reshape(view(qkv_buf, q_dim+1:q_dim+k_dim, :), hd, n_kv, seq_len)
         v_3d = reshape(view(qkv_buf, q_dim+k_dim+1:q_dim+2*k_dim, :), hd, n_kv, seq_len)
 
-        metal_rope!(q_3d, model.cos_table, model.sin_table, start_pos)
-        metal_rope!(k_3d, model.cos_table, model.sin_table, start_pos)
+        metal_rope_qk!(q_3d, k_3d, model.cos_table, model.sin_table, start_pos)
         append_kv!(cache, layer_idx, k_3d, v_3d)
 
         metal_flash_attention!(attn_out, q_3d, cache.k_cache[layer_idx],
                                cache.v_cache[layer_idx], dc.scale;
                                causal=true, causal_offset=cache.seq_len)
 
+        # O proj + fused residual add + rmsnorm for MLP
         fp16_linear!(o_buf, layer.o_proj, reshape(attn_out, h, seq_len))
         metal_rmsnorm_residual!(normed, x, o_buf, layer.post_attention_layernorm, dc.eps)
 
-        # Fused gate+up: one matmul instead of 2, then swiglu on slices
+        # Fused gate+up → swiglu → down proj
         fp16_linear!(gu_buf, layer.gate_up_proj, normed)
         metal_swiglu!(swiglu_buf, view(gu_buf, 1:inter, :), view(gu_buf, inter+1:2*inter, :))
         fp16_linear!(mlp_buf, layer.down_proj, swiglu_buf)
-        metal_add!(x, mlp_buf)
+
+        # Fuse MLP residual add + next layer's input rmsnorm into one dispatch
+        if layer_idx < n_layers
+            metal_rmsnorm_residual!(normed, x, mlp_buf,
+                                    model.layers[layer_idx + 1].input_layernorm, dc.eps)
+        else
+            metal_add!(x, mlp_buf)  # last layer: just add
+        end
     end
 
     cache.seq_len += seq_len

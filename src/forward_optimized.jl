@@ -144,8 +144,7 @@ function forward_opt!(model::LlamaModel, token_ids::MtlVector{Int32},
         k_3d = reshape(k_buf, hd, n_kv, seq_len)
         v_3d = reshape(v_buf, hd, n_kv, seq_len)
 
-        metal_rope!(q_3d, model.cos_table, model.sin_table, start_pos)
-        metal_rope!(k_3d, model.cos_table, model.sin_table, start_pos)
+        metal_rope_qk!(q_3d, k_3d, model.cos_table, model.sin_table, start_pos)
 
         append_kv!(cache, layer_idx, k_3d, v_3d)
 
