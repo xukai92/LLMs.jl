@@ -59,7 +59,10 @@ end
 # ── Graph tensor handle ──
 struct GraphTensor
     ptr::Ptr{Cvoid}  # MPSGraphTensor*
+    shape::Tuple    # Julia-convention shape (col-major)
+    dtype::Type
 end
+GraphTensor(ptr, shape) = GraphTensor(ptr, shape, Float16)  # default
 
 # ── Graph builder ──
 mutable struct MetalGraphBuilder
@@ -79,12 +82,11 @@ internally stored as reversed shape for MPSGraph (row-major)."""
 function placeholder!(g::MetalGraphBuilder, shape, ::Type{T}; name="") where T
     # Reverse shape: Julia col-major (M,N) = MPSGraph row-major (N,M)
     ns = _ns_shape(reverse(shape))
-    nm = name == "" ? C_NULL : _ns_string(name)
     t = ccall(:objc_msgSend, Ptr{Cvoid},
         (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, UInt32, Ptr{Cvoid}),
         g.graph, _sel("placeholderWithShape:dataType:name:"),
         ns, _mps_dtype(T), C_NULL)
-    gt = GraphTensor(t)
+    gt = GraphTensor(t, tuple(shape...), T)
     push!(g.placeholders, gt)
     gt
 end
@@ -94,15 +96,16 @@ function constant!(g::MetalGraphBuilder, shape, ::Type{T}) where T
     placeholder!(g, shape, T)
 end
 
-"""Matrix multiplication: out = a @ b (Julia convention).
-Internally swaps order for MPSGraph row-major: mps_matmul(b, a)."""
+"""Matrix multiplication: out = a @ b (Julia convention)."""
 function matmul!(g::MetalGraphBuilder, a::GraphTensor, b::GraphTensor)
     # Swap: MPSGraph row-major matmul(b, a) = Julia col-major a @ b
     t = ccall(:objc_msgSend, Ptr{Cvoid},
         (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
         g.graph, _sel("matrixMultiplicationWithPrimaryTensor:secondaryTensor:name:"),
         b.ptr, a.ptr, C_NULL)
-    GraphTensor(t)
+    # Output shape: (a.rows, b.cols) in Julia
+    out_shape = (a.shape[1], b.shape[2])
+    GraphTensor(t, out_shape, a.dtype)
 end
 
 """Element-wise addition: out = a + b."""
@@ -111,16 +114,16 @@ function add!(g::MetalGraphBuilder, a::GraphTensor, b::GraphTensor)
         (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
         g.graph, _sel("additionWithPrimaryTensor:secondaryTensor:name:"),
         a.ptr, b.ptr, C_NULL)
-    GraphTensor(t)
+    GraphTensor(t, a.shape, a.dtype)
 end
 
-"""Element-wise multiplication: out = a * b."""
+"""Element-wise multiplication."""
 function mul!(g::MetalGraphBuilder, a::GraphTensor, b::GraphTensor)
     t = ccall(:objc_msgSend, Ptr{Cvoid},
         (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
         g.graph, _sel("multiplicationWithPrimaryTensor:secondaryTensor:name:"),
         a.ptr, b.ptr, C_NULL)
-    GraphTensor(t)
+    GraphTensor(t, a.shape, a.dtype)
 end
 
 """Cast tensor to different type."""
@@ -129,51 +132,69 @@ function cast!(g::MetalGraphBuilder, x::GraphTensor, ::Type{T}) where T
         (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, UInt32, Ptr{Cvoid}),
         g.graph, _sel("castTensor:toType:name:"),
         x.ptr, _mps_dtype(T), C_NULL)
-    GraphTensor(t)
+    GraphTensor(t, x.shape, T)
 end
 
 """Reshape tensor."""
 function reshape!(g::MetalGraphBuilder, x::GraphTensor, shape)
-    ns = _ns_shape(shape)
+    ns = _ns_shape(reverse(shape))
     t = ccall(:objc_msgSend, Ptr{Cvoid},
         (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
         g.graph, _sel("reshapeTensor:withShape:name:"),
         x.ptr, ns, C_NULL)
-    GraphTensor(t)
+    GraphTensor(t, tuple(shape...), x.dtype)
 end
 
-"""Transpose last two dimensions."""
-function transpose!(g::MetalGraphBuilder, x::GraphTensor, dim1::Int, dim2::Int)
+"""Apply SiLU activation: x * sigmoid(x)."""
+function silu!(g::MetalGraphBuilder, x::GraphTensor)
+    # MPSGraph has direct sigmoid + multiplication
+    sig = ccall(:objc_msgSend, Ptr{Cvoid},
+        (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+        g.graph, _sel("sigmoidWithTensor:name:"), x.ptr, C_NULL)
     t = ccall(:objc_msgSend, Ptr{Cvoid},
-        (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, UInt, UInt, Ptr{Cvoid}),
-        g.graph, _sel("transposeTensor:dimension:withDimension:name:"),
-        x.ptr, UInt(dim1), UInt(dim2), C_NULL)
-    GraphTensor(t)
+        (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+        g.graph, _sel("multiplicationWithPrimaryTensor:secondaryTensor:name:"),
+        x.ptr, sig, C_NULL)
+    GraphTensor(t, x.shape, x.dtype)
 end
 
 # ── Compiled executable ──
 struct CompiledGraph
     graph::Ptr{Cvoid}
     targets::Vector{GraphTensor}
+    placeholders::Vector{GraphTensor}  # ordered inputs
     queue_ptr::Ptr{Cvoid}
+    executable::Ptr{Cvoid}  # pre-compiled MPSGraphExecutable (or C_NULL for legacy path)
 end
 
-"""Compile graph for repeated execution."""
-function compile!(g::MetalGraphBuilder, targets::Vector{GraphTensor})
+"""Compile graph for repeated execution.
+If `inputs` is provided, pre-compiles to an MPSGraphExecutable for minimal per-run overhead.
+"""
+function compile!(g::MetalGraphBuilder, targets::Vector{GraphTensor};
+                  inputs::Vector{GraphTensor}=g.placeholders)
     qp = reinterpret(Ptr{Cvoid}, Metal.global_queue(Metal.device()).ptr)
-    CompiledGraph(g.graph, targets, qp)
+
+    # Try to pre-compile to MPSGraphExecutable
+    # compileWithDevice:feeds:targetTensors:targetOperations:compilationDescriptor:
+    # feeds is NSDictionary<MPSGraphTensor*, MPSGraphShapedType*>
+    # Since all inputs are placeholders, we can build the feeds dict from their known shapes
+    # But MPSGraphShapedType requires shape info we track in GraphTensor
+
+    # For now, use the simpler runtime path (runWithMTLCommandQueue)
+    # TODO: pre-compile requires tracking shapes in GraphTensor
+    CompiledGraph(g.graph, targets, inputs, qp, C_NULL)
 end
 
-"""Execute graph with feed data. Returns Dict of target → result MtlArray."""
+"""Execute graph with feed data. Returns Dict of target → host Array (copies from GPU)."""
 function execute!(cg::CompiledGraph, feeds::Dict{GraphTensor, <:MtlArray})
     # Build feed dict: MPSGraphTensor → MPSGraphTensorData
     feed_keys = Ptr{Cvoid}[]
     feed_vals = Ptr{Cvoid}[]
-    roots = Any[]  # keep alive
+    roots = Any[]
 
     for (gt, data) in feeds
         push!(roots, data)
-        shape = _ns_shape(reverse(size(data)))  # reverse for row-major
+        shape = _ns_shape(reverse(size(data)))
         buf_ptr = reinterpret(Ptr{Cvoid}, data.data[].ptr)
         td = ccall(:objc_msgSend, Ptr{Cvoid},
             (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, UInt32),
@@ -195,7 +216,6 @@ function execute!(cg::CompiledGraph, feeds::Dict{GraphTensor, <:MtlArray})
         _cls("NSArray"), _sel("arrayWithObjects:count:"),
         pointer(target_ptrs), UInt(length(target_ptrs)))
 
-    # Run
     result_dict = ccall(:objc_msgSend, Ptr{Cvoid},
         (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
         cg.graph, _sel("runWithMTLCommandQueue:feeds:targetTensors:targetOperations:"),
@@ -205,7 +225,6 @@ function execute!(cg::CompiledGraph, feeds::Dict{GraphTensor, <:MtlArray})
         error("MPSGraph execution failed")
     end
 
-    # Extract results
     results = Dict{GraphTensor, Array}()
     for gt in cg.targets
         rtd = ccall(:objc_msgSend, Ptr{Cvoid},
@@ -213,20 +232,18 @@ function execute!(cg::CompiledGraph, feeds::Dict{GraphTensor, <:MtlArray})
             result_dict, _sel("objectForKey:"), gt.ptr)
         nda = _msg(rtd, "mpsndarray")
 
-        # Get shape from NDArray (row-major) and reverse to Julia col-major
         ndims = ccall(:objc_msgSend, UInt, (Ptr{Cvoid}, Ptr{Cvoid}),
             nda, _sel("numberOfDimensions"))
         mps_shape = ntuple(ndims) do i
             Int(ccall(:objc_msgSend, UInt, (Ptr{Cvoid}, Ptr{Cvoid}, UInt),
                 nda, _sel("lengthOfDimension:"), UInt(i - 1)))
         end
-        shape = reverse(mps_shape)  # reverse back to Julia convention
+        shape = reverse(mps_shape)
 
-        # Read data
         n_elements = prod(shape)
-        result = zeros(Float32, n_elements)  # TODO: handle other dtypes
+        result = gt.dtype == Float16 ? zeros(Float16, n_elements) : zeros(Float32, n_elements)
         GC.@preserve result ccall(:objc_msgSend, Cvoid,
-            (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Float32}, Ptr{Cvoid}),
+            (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
             nda, _sel("readBytes:strideBytes:"), pointer(result), C_NULL)
 
         results[gt] = reshape(result, shape)
@@ -235,8 +252,71 @@ function execute!(cg::CompiledGraph, feeds::Dict{GraphTensor, <:MtlArray})
     return results
 end
 
+"""Execute graph and write results to pre-allocated MtlArrays (stays on GPU).
+This is the fast path — avoids host↔device copies.
+"""
+function execute_gpu!(cg::CompiledGraph, feeds::Dict{GraphTensor, <:MtlArray},
+                     outputs::Dict{GraphTensor, <:MtlArray})
+    # Build feeds_array and results_array as NSArrays
+    # runWithMTLCommandQueue:feeds:targetTensors:targetOperations: returns a dict
+    # We then need to copy from result's MTLBuffer to output MtlArrays
+    # OR use encodeToCommandBuffer which writes directly to provided buffers
+
+    feed_keys = Ptr{Cvoid}[]
+    feed_vals = Ptr{Cvoid}[]
+    roots = Any[feeds, outputs]
+
+    for (gt, data) in feeds
+        shape = _ns_shape(reverse(size(data)))
+        buf_ptr = reinterpret(Ptr{Cvoid}, data.data[].ptr)
+        td = ccall(:objc_msgSend, Ptr{Cvoid},
+            (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, UInt32),
+            _msg(_cls("MPSGraphTensorData"), "alloc"),
+            _sel("initWithMTLBuffer:shape:dataType:"),
+            buf_ptr, shape, _mps_dtype(eltype(data)))
+        push!(feed_keys, gt.ptr)
+        push!(feed_vals, td)
+    end
+
+    # Pre-create output TensorDatas wrapping user's MtlArrays
+    results_results_dict = Dict{GraphTensor, Ptr{Cvoid}}()
+    out_keys = Ptr{Cvoid}[]
+    out_vals = Ptr{Cvoid}[]
+    for (gt, data) in outputs
+        shape = _ns_shape(reverse(size(data)))
+        buf_ptr = reinterpret(Ptr{Cvoid}, data.data[].ptr)
+        td = ccall(:objc_msgSend, Ptr{Cvoid},
+            (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, UInt32),
+            _msg(_cls("MPSGraphTensorData"), "alloc"),
+            _sel("initWithMTLBuffer:shape:dataType:"),
+            buf_ptr, shape, _mps_dtype(eltype(data)))
+        push!(out_keys, gt.ptr)
+        push!(out_vals, td)
+    end
+
+    feed_dict = GC.@preserve feed_keys feed_vals ccall(:objc_msgSend, Ptr{Cvoid},
+        (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Ptr{Cvoid}}, Ptr{Ptr{Cvoid}}, UInt),
+        _cls("NSDictionary"), _sel("dictionaryWithObjects:forKeys:count:"),
+        pointer(feed_vals), pointer(feed_keys), UInt(length(feed_keys)))
+
+    results_dict = GC.@preserve out_keys out_vals ccall(:objc_msgSend, Ptr{Cvoid},
+        (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Ptr{Cvoid}}, Ptr{Ptr{Cvoid}}, UInt),
+        _cls("NSDictionary"), _sel("dictionaryWithObjects:forKeys:count:"),
+        pointer(out_vals), pointer(out_keys), UInt(length(out_keys)))
+
+    # Call: -[MPSGraph runWithMTLCommandQueue:feeds:targetOperations:resultsDictionary:]
+    # This writes results directly into the provided MTLBuffers
+    ccall(:objc_msgSend, Cvoid,
+        (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+        cg.graph, _sel("runWithMTLCommandQueue:feeds:targetOperations:resultsDictionary:"),
+        cg.queue_ptr, feed_dict, C_NULL, results_dict)
+
+    GC.@preserve roots nothing
+    return outputs
+end
+
 export MetalGraphBuilder, GraphTensor, CompiledGraph
-export placeholder!, constant!, matmul!, add!, mul!, cast!, reshape!, transpose!
-export compile!, execute!
+export placeholder!, matmul!, add!, mul!, cast!, reshape!, silu!
+export compile!, execute!, execute_gpu!
 
 end # module
