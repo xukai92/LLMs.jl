@@ -638,9 +638,306 @@ function build_full_forward(hidden::Int, head_dim::Int, n_q_heads::Int, n_kv_hea
         n_layers, hidden, seq_len)
 end
 
+# ── Decode graph with KV cache ──
+
+struct GraphDecodeLayer
+    """Single-layer decode graph: takes KV cache as input, outputs layer result + new K/V."""
+    compiled::CompiledGraph
+
+    # Placeholders
+    x_ph::GraphTensor           # input (hidden, 1) — already normed
+    residual_ph::GraphTensor    # residual (hidden, 1)
+    w_qkv_ph::GraphTensor
+    w_o_ph::GraphTensor
+    cos_ph::GraphTensor         # (half_hd, 1) for current position
+    sin_ph::GraphTensor
+    k_cache_ph::GraphTensor     # (head_dim, n_kv, max_len)
+    v_cache_ph::GraphTensor     # (head_dim, n_kv, max_len)
+    attn_mask_ph::GraphTensor   # (1, max_len) — 0 for valid, -1e4 for invalid
+    post_norm_w_ph::GraphTensor
+    w_gate_up_ph::GraphTensor
+    w_down_ph::GraphTensor
+
+    # Outputs
+    out_residual::GraphTensor   # (hidden, 1)
+    new_k::GraphTensor          # (head_dim, n_kv, 1) — to append to cache
+    new_v::GraphTensor          # (head_dim, n_kv, 1)
+
+    max_len::Int
+end
+
+"""Build a decode (seq=1) transformer layer with KV cache attention.
+The KV cache is passed as a placeholder of fixed max_len; a mask hides unused positions."""
+function build_decode_layer(hidden::Int, head_dim::Int, n_q_heads::Int, n_kv_heads::Int,
+                            intermediate::Int, max_len::Int, eps::Float32)
+    g = MetalGraphBuilder()
+    q_dim = n_q_heads * head_dim
+    kv_dim = n_kv_heads * head_dim
+    qkv_dim = q_dim + 2 * kv_dim
+    half_hd = head_dim ÷ 2
+    gqa_ratio = n_q_heads ÷ n_kv_heads
+    scale = Float16(1.0 / sqrt(Float64(head_dim)))
+
+    # Placeholders
+    x_ph = placeholder!(g, (hidden, 1), Float16)
+    residual_ph = placeholder!(g, (hidden, 1), Float16)
+    w_qkv_ph = placeholder!(g, (qkv_dim, hidden), Float16)
+    w_o_ph = placeholder!(g, (hidden, q_dim), Float16)
+    cos_ph = placeholder!(g, (half_hd, 1), Float16)
+    sin_ph = placeholder!(g, (half_hd, 1), Float16)
+    k_cache_ph = placeholder!(g, (head_dim, n_kv_heads, max_len), Float16)
+    v_cache_ph = placeholder!(g, (head_dim, n_kv_heads, max_len), Float16)
+    attn_mask_ph = placeholder!(g, (1, max_len), Float16)  # 0 or -1e4
+    post_norm_w_ph = placeholder!(g, (hidden, 1), Float16)
+    w_gu_ph = placeholder!(g, (2 * intermediate, hidden), Float16)
+    w_down_ph = placeholder!(g, (hidden, intermediate), Float16)
+
+    # ── QKV ──
+    qkv = matmul!(g, w_qkv_ph, x_ph)  # (qkv_dim, 1)
+    q_flat = slice!(g, qkv, 1, 0, q_dim)
+    k_flat = slice!(g, qkv, 1, q_dim, kv_dim)
+    v_flat = slice!(g, qkv, 1, q_dim + kv_dim, kv_dim)
+
+    # Reshape to 3D: (head_dim, n_heads, 1)
+    q_3d = reshape!(g, q_flat, (head_dim, n_q_heads, 1))
+    k_3d = reshape!(g, k_flat, (head_dim, n_kv_heads, 1))
+    v_3d = reshape!(g, v_flat, (head_dim, n_kv_heads, 1))
+
+    # RoPE
+    cos_3d = reshape!(g, cos_ph, (half_hd, 1, 1))
+    sin_3d = reshape!(g, sin_ph, (half_hd, 1, 1))
+    q_roped = apply_rope!(g, q_3d, cos_3d, sin_3d, half_hd)
+    k_roped = apply_rope!(g, k_3d, cos_3d, sin_3d, half_hd)
+
+    # New K/V to output (for cache update)
+    new_k = k_roped  # (head_dim, n_kv, 1)
+    new_v = v_3d     # (head_dim, n_kv, 1) — V doesn't get RoPE
+
+    # ── Attention with KV cache ──
+    # K cache: (head_dim, n_kv, max_len) — already includes all past K
+    # For the current step, the caller should have already written new_k into the cache
+    # at the right position. So k_cache_ph is the FULL cache including this step.
+    # (We output new_k/new_v for the caller to update cache BEFORE the next call.)
+
+    # Q: (head_dim, n_q, 1) → need (1, head_dim, n_q) for batched matmul
+    q_t = graph_transpose!(g, q_roped, 2, 3)    # (head_dim, 1, n_q)
+    q_t = graph_transpose!(g, q_t, 1, 2)         # (1, head_dim, n_q)
+
+    # K cache: (head_dim, n_kv, max_len) → (head_dim, max_len, n_kv) for matmul
+    k_t = graph_transpose!(g, k_cache_ph, 2, 3)  # (head_dim, max_len, n_kv)
+
+    # V cache: same rearrangement
+    v_t = graph_transpose!(g, v_cache_ph, 2, 3)  # (head_dim, max_len, n_kv)
+
+    # GQA tiling for K and V
+    if gqa_ratio > 1
+        k_exp = expanddims!(g, k_t, 3)
+        k_tiled = concat!(g, [k_exp for _ in 1:gqa_ratio], 3)
+        k_t = reshape!(g, k_tiled, (head_dim, max_len, n_q_heads))
+
+        v_exp = expanddims!(g, v_t, 3)
+        v_tiled = concat!(g, [v_exp for _ in 1:gqa_ratio], 3)
+        v_t = reshape!(g, v_tiled, (head_dim, max_len, n_q_heads))
+    end
+
+    # Scores: (1, head_dim, n_q) @ (head_dim, max_len, n_q) → (1, max_len, n_q)
+    scores = matmul!(g, q_t, k_t)
+    scores = mul!(g, scores, constant_scalar!(g, Float64(scale), Float16))
+
+    # Apply mask: attn_mask is (1, max_len), broadcast over n_q
+    scores = add!(g, scores, attn_mask_ph)
+
+    # Softmax along dim 2 (the max_len dimension: (1, max_len, n_q) → softmax over max_len)
+    attn_w = softmax!(g, scores, 2)
+
+    # Value aggregation: (head_dim, max_len, n_q) @ (max_len, 1, n_q)
+    # We need attn_w transposed: (1, max_len, n_q) → (max_len, 1, n_q)
+    attn_w_t = graph_transpose!(g, attn_w, 1, 2)  # (max_len, 1, n_q)
+    # Actually: matmul!(v_t, attn_w_t) = (head_dim, max_len, n_q) @ (max_len, 1, n_q) → (head_dim, 1, n_q)
+    attn_out = matmul!(g, v_t, attn_w_t)
+
+    # Reshape back: (head_dim, 1, n_q) → (head_dim, n_q, 1) → (q_dim, 1)
+    attn_out = graph_transpose!(g, attn_out, 2, 3)  # (head_dim, n_q, 1)
+    attn_flat = reshape!(g, attn_out, (q_dim, 1))
+
+    # O projection + residual
+    o_out = matmul!(g, w_o_ph, attn_flat)
+    attn_res = add!(g, residual_ph, o_out)
+
+    # ── MLP ──
+    normed_mlp = rmsnorm!(g, attn_res, post_norm_w_ph, eps)
+    gu = matmul!(g, w_gu_ph, normed_mlp)
+    gate_out = slice!(g, gu, 1, 0, intermediate)
+    up_out = slice!(g, gu, 1, intermediate, intermediate)
+    mlp_out = matmul!(g, w_down_ph, mul!(g, silu!(g, gate_out), up_out))
+    out_residual = add!(g, attn_res, mlp_out)
+
+    compiled = compile!(g, [out_residual, new_k, new_v])
+
+    GraphDecodeLayer(compiled,
+        x_ph, residual_ph, w_qkv_ph, w_o_ph, cos_ph, sin_ph,
+        k_cache_ph, v_cache_ph, attn_mask_ph,
+        post_norm_w_ph, w_gu_ph, w_down_ph,
+        out_residual, new_k, new_v, max_len)
+end
+
+
+# ── Fused multi-layer decode ──
+
+struct GraphDecodeFull
+    """Fused N-layer decode graph with KV cache."""
+    compiled::CompiledGraph
+
+    # Shared
+    x_ph::GraphTensor
+    cos_ph::GraphTensor
+    sin_ph::GraphTensor
+    attn_mask_ph::GraphTensor
+
+    # Per-layer
+    input_norm_ws::Vector{GraphTensor}
+    w_qkvs::Vector{GraphTensor}
+    w_os::Vector{GraphTensor}
+    k_caches::Vector{GraphTensor}
+    v_caches::Vector{GraphTensor}
+    post_norm_ws::Vector{GraphTensor}
+    w_gate_ups::Vector{GraphTensor}
+    w_downs::Vector{GraphTensor}
+
+    # Final norm
+    final_norm_w_ph::GraphTensor
+
+    # Outputs
+    out::GraphTensor
+    new_ks::Vector{GraphTensor}
+    new_vs::Vector{GraphTensor}
+
+    n_layers::Int
+    max_len::Int
+end
+
+"""Build fused N-layer decode graph with KV cache attention."""
+function build_decode_full(hidden::Int, head_dim::Int, n_q_heads::Int, n_kv_heads::Int,
+                           intermediate::Int, max_len::Int, n_layers::Int, eps::Float32)
+    g = MetalGraphBuilder()
+    q_dim = n_q_heads * head_dim
+    kv_dim = n_kv_heads * head_dim
+    qkv_dim = q_dim + 2 * kv_dim
+    half_hd = head_dim ÷ 2
+    gqa_ratio = n_q_heads ÷ n_kv_heads
+    scale = Float16(1.0 / sqrt(Float64(head_dim)))
+
+    # Shared placeholders
+    x_ph = placeholder!(g, (hidden, 1), Float16)
+    cos_ph = placeholder!(g, (half_hd, 1), Float16)
+    sin_ph = placeholder!(g, (half_hd, 1), Float16)
+    attn_mask_ph = placeholder!(g, (1, max_len), Float16)
+
+    cos_3d = reshape!(g, cos_ph, (half_hd, 1, 1))
+    sin_3d = reshape!(g, sin_ph, (half_hd, 1, 1))
+
+    input_norm_ws = GraphTensor[]
+    w_qkvs = GraphTensor[]
+    w_os = GraphTensor[]
+    k_caches = GraphTensor[]
+    v_caches = GraphTensor[]
+    post_norm_ws = GraphTensor[]
+    w_gate_ups = GraphTensor[]
+    w_downs = GraphTensor[]
+    new_ks = GraphTensor[]
+    new_vs = GraphTensor[]
+
+    residual = x_ph
+
+    for _ in 1:n_layers
+        in_nw = placeholder!(g, (hidden, 1), Float16)
+        wqkv = placeholder!(g, (qkv_dim, hidden), Float16)
+        wo = placeholder!(g, (hidden, q_dim), Float16)
+        kc = placeholder!(g, (head_dim, n_kv_heads, max_len), Float16)
+        vc = placeholder!(g, (head_dim, n_kv_heads, max_len), Float16)
+        post_nw = placeholder!(g, (hidden, 1), Float16)
+        wgu = placeholder!(g, (2 * intermediate, hidden), Float16)
+        wd = placeholder!(g, (hidden, intermediate), Float16)
+
+        push!(input_norm_ws, in_nw); push!(w_qkvs, wqkv); push!(w_os, wo)
+        push!(k_caches, kc); push!(v_caches, vc)
+        push!(post_norm_ws, post_nw); push!(w_gate_ups, wgu); push!(w_downs, wd)
+
+        # RMSNorm + QKV
+        normed = rmsnorm!(g, residual, in_nw, eps)
+        qkv = matmul!(g, wqkv, normed)
+        q_flat = slice!(g, qkv, 1, 0, q_dim)
+        k_flat = slice!(g, qkv, 1, q_dim, kv_dim)
+        v_flat = slice!(g, qkv, 1, q_dim + kv_dim, kv_dim)
+
+        q_3d = reshape!(g, q_flat, (head_dim, n_q_heads, 1))
+        k_3d = reshape!(g, k_flat, (head_dim, n_kv_heads, 1))
+        v_3d = reshape!(g, v_flat, (head_dim, n_kv_heads, 1))
+
+        q_roped = apply_rope!(g, q_3d, cos_3d, sin_3d, half_hd)
+        k_roped = apply_rope!(g, k_3d, cos_3d, sin_3d, half_hd)
+        push!(new_ks, k_roped)
+        push!(new_vs, v_3d)
+
+        # Attention with KV cache
+        q_t = graph_transpose!(g, q_roped, 2, 3)
+        q_t = graph_transpose!(g, q_t, 1, 2)     # (1, head_dim, n_q)
+        k_t = graph_transpose!(g, kc, 2, 3)       # (head_dim, max_len, n_kv)
+        v_t = graph_transpose!(g, vc, 2, 3)       # (head_dim, max_len, n_kv)
+
+        if gqa_ratio > 1
+            k_exp = expanddims!(g, k_t, 3)
+            k_tiled = concat!(g, [k_exp for _ in 1:gqa_ratio], 3)
+            k_t = reshape!(g, k_tiled, (head_dim, max_len, n_q_heads))
+            v_exp = expanddims!(g, v_t, 3)
+            v_tiled = concat!(g, [v_exp for _ in 1:gqa_ratio], 3)
+            v_t = reshape!(g, v_tiled, (head_dim, max_len, n_q_heads))
+        end
+
+        scores = matmul!(g, q_t, k_t)  # (1, max_len, n_q)
+        scores = mul!(g, scores, constant_scalar!(g, Float64(scale), Float16))
+        scores = add!(g, scores, attn_mask_ph)
+        attn_w = softmax!(g, scores, 2)
+
+        attn_w_t = graph_transpose!(g, attn_w, 1, 2)  # (max_len, 1, n_q)
+        attn_out = matmul!(g, v_t, attn_w_t)           # (head_dim, 1, n_q)
+        attn_out = graph_transpose!(g, attn_out, 2, 3)  # (head_dim, n_q, 1)
+        attn_flat = reshape!(g, attn_out, (q_dim, 1))
+
+        o_out = matmul!(g, wo, attn_flat)
+        residual = add!(g, residual, o_out)
+
+        # MLP
+        normed_mlp = rmsnorm!(g, residual, post_nw, eps)
+        gu = matmul!(g, wgu, normed_mlp)
+        gate_out = slice!(g, gu, 1, 0, intermediate)
+        up_out = slice!(g, gu, 1, intermediate, intermediate)
+        mlp_out = matmul!(g, wd, mul!(g, silu!(g, gate_out), up_out))
+        residual = add!(g, residual, mlp_out)
+    end
+
+    final_nw = placeholder!(g, (hidden, 1), Float16)
+    final_out = rmsnorm!(g, residual, final_nw, eps)
+
+    all_outputs = GraphTensor[final_out]
+    append!(all_outputs, new_ks)
+    append!(all_outputs, new_vs)
+
+    compiled = compile!(g, all_outputs)
+
+    GraphDecodeFull(compiled,
+        x_ph, cos_ph, sin_ph, attn_mask_ph,
+        input_norm_ws, w_qkvs, w_os, k_caches, v_caches,
+        post_norm_ws, w_gate_ups, w_downs,
+        final_nw, final_out, new_ks, new_vs,
+        n_layers, max_len)
+end
+
 export GraphMLP, build_mlp_graph, execute_mlp!
 export GraphAttention, build_attention_graph, apply_rope!
 export GraphTransformerLayer, build_transformer_layer
 export GraphFullForward, build_full_forward
+export GraphDecodeLayer, build_decode_layer
+export GraphDecodeFull, build_decode_full
 
 end # module
