@@ -35,9 +35,19 @@ julia --project=. scripts/serve.jl
 
 ## Performance
 
-All benchmarks on M3 Max, Llama-3.2-3B dimensions, FP16.
+All benchmarks on M3 Max with Llama-3.2-3B-Instruct-4bit.
 
-### End-to-end throughput (MPSGraph, 28-layer forward pass)
+### Quality: MATH50
+
+50 problems sampled from [MATH500](https://huggingface.co/datasets/HuggingFaceH4/MATH-500), verified by extracting `\boxed{}` answers.
+
+| | Accuracy | Throughput |
+|-|----------|------------|
+| MLX (baseline) | 32.0% (16/50) | 153 tok/s |
+
+Run: `python scripts/bench_math50.py`
+
+### End-to-end throughput (MPSGraph, FP16, 28-layer forward pass)
 
 | Mode | LLMs.jl | MLX | Speedup |
 |------|---------|-----|---------|
