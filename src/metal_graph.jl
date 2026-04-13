@@ -96,15 +96,17 @@ function constant!(g::MetalGraphBuilder, shape, ::Type{T}) where T
     placeholder!(g, shape, T)
 end
 
-"""Matrix multiplication: out = a @ b (Julia convention)."""
+"""Matrix multiplication: out = a @ b (Julia convention).
+Supports batched matmul: (M, K, B...) @ (K, N, B...) → (M, N, B...)."""
 function matmul!(g::MetalGraphBuilder, a::GraphTensor, b::GraphTensor)
     # Swap: MPSGraph row-major matmul(b, a) = Julia col-major a @ b
     t = ccall(:objc_msgSend, Ptr{Cvoid},
         (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
         g.graph, _sel("matrixMultiplicationWithPrimaryTensor:secondaryTensor:name:"),
         b.ptr, a.ptr, C_NULL)
-    # Output shape: (a.rows, b.cols) in Julia
-    out_shape = (a.shape[1], b.shape[2])
+    # Output shape: (a.rows, b.cols, batch_dims...) in Julia
+    batch_dims = length(a.shape) > 2 ? a.shape[3:end] : ()
+    out_shape = (a.shape[1], b.shape[2], batch_dims...)
     GraphTensor(t, out_shape, a.dtype)
 end
 
@@ -143,6 +145,177 @@ function reshape!(g::MetalGraphBuilder, x::GraphTensor, shape)
         g.graph, _sel("reshapeTensor:withShape:name:"),
         x.ptr, ns, C_NULL)
     GraphTensor(t, tuple(shape...), x.dtype)
+end
+
+# ── Axis conversion helper ──
+# Julia dim d in ndims-dimensional tensor → MPSGraph axis (ndims - d)
+_mps_axis(julia_dim::Int, ndims::Int) = Int64(ndims - julia_dim)
+
+"""Element-wise subtraction: out = a - b."""
+function sub!(g::MetalGraphBuilder, a::GraphTensor, b::GraphTensor)
+    t = ccall(:objc_msgSend, Ptr{Cvoid},
+        (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+        g.graph, _sel("subtractionWithPrimaryTensor:secondaryTensor:name:"),
+        a.ptr, b.ptr, C_NULL)
+    GraphTensor(t, a.shape, a.dtype)
+end
+
+"""Element-wise division: out = a / b."""
+function div!(g::MetalGraphBuilder, a::GraphTensor, b::GraphTensor)
+    t = ccall(:objc_msgSend, Ptr{Cvoid},
+        (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+        g.graph, _sel("divisionWithPrimaryTensor:secondaryTensor:name:"),
+        a.ptr, b.ptr, C_NULL)
+    GraphTensor(t, a.shape, a.dtype)
+end
+
+"""Element-wise negation: out = -x."""
+function neg!(g::MetalGraphBuilder, x::GraphTensor)
+    t = ccall(:objc_msgSend, Ptr{Cvoid},
+        (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+        g.graph, _sel("negativeWithTensor:name:"), x.ptr, C_NULL)
+    GraphTensor(t, x.shape, x.dtype)
+end
+
+"""Element-wise square: out = x^2."""
+function square!(g::MetalGraphBuilder, x::GraphTensor)
+    t = ccall(:objc_msgSend, Ptr{Cvoid},
+        (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+        g.graph, _sel("squareWithTensor:name:"), x.ptr, C_NULL)
+    GraphTensor(t, x.shape, x.dtype)
+end
+
+"""Reciprocal square root: out = 1/sqrt(x)."""
+function rsqrt!(g::MetalGraphBuilder, x::GraphTensor)
+    t = ccall(:objc_msgSend, Ptr{Cvoid},
+        (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+        g.graph, _sel("reverseSquareRootWithTensor:name:"), x.ptr, C_NULL)
+    GraphTensor(t, x.shape, x.dtype)
+end
+
+"""Mean reduction along Julia dimension(s)."""
+function mean!(g::MetalGraphBuilder, x::GraphTensor, julia_dims::Vector{Int})
+    nd = length(x.shape)
+    axes_ns = _ns_shape([_mps_axis(d, nd) for d in julia_dims])
+    t = ccall(:objc_msgSend, Ptr{Cvoid},
+        (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+        g.graph, _sel("meanOfTensor:axes:name:"),
+        x.ptr, axes_ns, C_NULL)
+    # Output shape: reduced dims become 1
+    out_shape = ntuple(length(x.shape)) do i
+        i in julia_dims ? 1 : x.shape[i]
+    end
+    GraphTensor(t, out_shape, x.dtype)
+end
+
+"""Create a scalar constant tensor (broadcast-compatible)."""
+function constant_scalar!(g::MetalGraphBuilder, value::Real, ::Type{T}) where T
+    t = ccall(:objc_msgSend, Ptr{Cvoid},
+        (Ptr{Cvoid}, Ptr{Cvoid}, Float64, UInt32),
+        g.graph, _sel("constantWithScalar:dataType:"),
+        Float64(value), _mps_dtype(T))
+    GraphTensor(t, (1,), T)
+end
+
+"""Create a constant tensor with specific shape, filled with a scalar value."""
+function constant_fill!(g::MetalGraphBuilder, value::Real, shape, ::Type{T}) where T
+    ns = _ns_shape(reverse(shape))
+    t = ccall(:objc_msgSend, Ptr{Cvoid},
+        (Ptr{Cvoid}, Ptr{Cvoid}, Float64, Ptr{Cvoid}, UInt32),
+        g.graph, _sel("constantWithScalar:shape:dataType:"),
+        Float64(value), ns, _mps_dtype(T))
+    GraphTensor(t, tuple(shape...), T)
+end
+
+"""RMS normalization: x / sqrt(mean(x^2, dim=1) + eps) * gamma.
+gamma is a GraphTensor placeholder for the norm weights."""
+function rmsnorm!(g::MetalGraphBuilder, x::GraphTensor, gamma::GraphTensor, eps::Float32)
+    x_sq = square!(g, x)
+    ms = mean!(g, x_sq, [1])  # mean along feature dim
+    eps_t = constant_scalar!(g, eps, x.dtype)
+    ms_eps = add!(g, ms, eps_t)
+    inv = rsqrt!(g, ms_eps)
+    normed = mul!(g, x, inv)
+    mul!(g, normed, gamma)
+end
+
+"""Softmax along Julia dimension."""
+function softmax!(g::MetalGraphBuilder, x::GraphTensor, julia_dim::Int)
+    mps_ax = _mps_axis(julia_dim, length(x.shape))
+    t = ccall(:objc_msgSend, Ptr{Cvoid},
+        (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Int64, Ptr{Cvoid}),
+        g.graph, _sel("softMaxWithTensor:axis:name:"),
+        x.ptr, mps_ax, C_NULL)
+    GraphTensor(t, x.shape, x.dtype)
+end
+
+"""Slice along a single Julia dimension: out = x[..., start:start+length-1, ...]."""
+function slice!(g::MetalGraphBuilder, x::GraphTensor, julia_dim::Int, start::Int, len::Int)
+    mps_ax = _mps_axis(julia_dim, length(x.shape))
+    t = ccall(:objc_msgSend, Ptr{Cvoid},
+        (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, UInt, Int64, Int64, Ptr{Cvoid}),
+        g.graph, _sel("sliceTensor:dimension:start:length:name:"),
+        x.ptr, UInt(mps_ax), Int64(start), Int64(len), C_NULL)
+    out_shape = ntuple(length(x.shape)) do i
+        i == julia_dim ? len : x.shape[i]
+    end
+    GraphTensor(t, out_shape, x.dtype)
+end
+
+"""Concatenate tensors along Julia dimension."""
+function concat!(g::MetalGraphBuilder, tensors::Vector{GraphTensor}, julia_dim::Int)
+    mps_ax = _mps_axis(julia_dim, length(tensors[1].shape))
+    ptrs = [t.ptr for t in tensors]
+    ns_arr = GC.@preserve ptrs ccall(:objc_msgSend, Ptr{Cvoid},
+        (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Ptr{Cvoid}}, UInt),
+        _cls("NSArray"), _sel("arrayWithObjects:count:"),
+        pointer(ptrs), UInt(length(ptrs)))
+    t = ccall(:objc_msgSend, Ptr{Cvoid},
+        (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Int64, Ptr{Cvoid}),
+        g.graph, _sel("concatTensors:dimension:name:"),
+        ns_arr, Int64(mps_ax), C_NULL)
+    total = sum(tensors[i].shape[julia_dim] for i in eachindex(tensors))
+    out_shape = ntuple(length(tensors[1].shape)) do i
+        i == julia_dim ? total : tensors[1].shape[i]
+    end
+    GraphTensor(t, out_shape, tensors[1].dtype)
+end
+
+"""Transpose two Julia dimensions."""
+function graph_transpose!(g::MetalGraphBuilder, x::GraphTensor, dim1::Int, dim2::Int)
+    nd = length(x.shape)
+    mps1 = UInt(_mps_axis(dim1, nd)); mps2 = UInt(_mps_axis(dim2, nd))
+    t = ccall(:objc_msgSend, Ptr{Cvoid},
+        (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, UInt, UInt, Ptr{Cvoid}),
+        g.graph, _sel("transposeTensor:dimension:withDimension:name:"),
+        x.ptr, mps1, mps2, C_NULL)
+    out_shape = ntuple(nd) do i
+        i == dim1 ? x.shape[dim2] : i == dim2 ? x.shape[dim1] : x.shape[i]
+    end
+    GraphTensor(t, out_shape, x.dtype)
+end
+
+"""Expand dims: insert a size-1 dimension at Julia position."""
+function expanddims!(g::MetalGraphBuilder, x::GraphTensor, julia_dim::Int)
+    nd = length(x.shape) + 1
+    mps_ax = Int64(_mps_axis(julia_dim, nd))
+    t = ccall(:objc_msgSend, Ptr{Cvoid},
+        (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Int64, Ptr{Cvoid}),
+        g.graph, _sel("expandDimsOfTensor:axis:name:"),
+        x.ptr, mps_ax, C_NULL)
+    new_shape = ntuple(nd) do i
+        i < julia_dim ? x.shape[i] : i == julia_dim ? 1 : x.shape[i-1]
+    end
+    GraphTensor(t, new_shape, x.dtype)
+end
+
+"""Create lower-triangular band matrix for causal masking."""
+function bandpart!(g::MetalGraphBuilder, x::GraphTensor, num_lower::Int, num_upper::Int)
+    t = ccall(:objc_msgSend, Ptr{Cvoid},
+        (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Int64, Int64, Ptr{Cvoid}),
+        g.graph, _sel("bandPartWithTensor:numLower:numUpper:name:"),
+        x.ptr, Int64(num_lower), Int64(num_upper), C_NULL)
+    GraphTensor(t, x.shape, x.dtype)
 end
 
 """Apply SiLU activation: x * sigmoid(x)."""
@@ -234,11 +407,12 @@ function execute!(cg::CompiledGraph, feeds::Dict{GraphTensor, <:MtlArray})
 
         ndims = ccall(:objc_msgSend, UInt, (Ptr{Cvoid}, Ptr{Cvoid}),
             nda, _sel("numberOfDimensions"))
+        # MPSNDArray reports dimensions in Julia (col-major) order already
         mps_shape = ntuple(ndims) do i
             Int(ccall(:objc_msgSend, UInt, (Ptr{Cvoid}, Ptr{Cvoid}, UInt),
                 nda, _sel("lengthOfDimension:"), UInt(i - 1)))
         end
-        shape = reverse(mps_shape)
+        shape = mps_shape
 
         n_elements = prod(shape)
         result = gt.dtype == Float16 ? zeros(Float16, n_elements) : zeros(Float32, n_elements)
@@ -316,7 +490,10 @@ function execute_gpu!(cg::CompiledGraph, feeds::Dict{GraphTensor, <:MtlArray},
 end
 
 export MetalGraphBuilder, GraphTensor, CompiledGraph
-export placeholder!, matmul!, add!, mul!, cast!, reshape!, silu!
+export placeholder!, constant!, matmul!, add!, sub!, mul!, div!, neg!
+export square!, rsqrt!, mean!, cast!, reshape!, silu!, rmsnorm!
+export softmax!, slice!, concat!, graph_transpose!, expanddims!, bandpart!
+export constant_scalar!, constant_fill!
 export compile!, execute!, execute_gpu!
 
 end # module
