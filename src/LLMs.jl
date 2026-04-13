@@ -72,7 +72,7 @@ export metal_qmatmul_v4!
 export metal_fused_gate_up_swiglu!
 export metal_flash_attention!
 export metal_fused_qkv!
-export metal_qmatmul_vec!, metal_fp16_matmul!
+export metal_qmatmul_vec!, metal_fp16_matmul!, metal_qmatmul_sg!
 export metal_argmax_last_col, metal_argmax_last_col!
 
 # Phase 2 model exports
