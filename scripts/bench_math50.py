@@ -95,12 +95,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="mlx-community/Llama-3.2-3B-Instruct-4bit")
     parser.add_argument("--max-tokens", type=int, default=512)
+    parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
 
     # Load problems
     data_path = os.path.join(os.path.dirname(__file__), "..", "data", "math50.json")
     with open(data_path) as f:
         problems = json.load(f)
+    if args.limit is not None:
+        problems = problems[:args.limit]
     print(f"Loaded {len(problems)} problems from MATH50", flush=True)
 
     # Load model

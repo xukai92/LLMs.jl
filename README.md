@@ -44,8 +44,24 @@ All benchmarks on M3 Max with Llama-3.2-3B-Instruct-4bit.
 | | Accuracy | Throughput |
 |-|----------|------------|
 | MLX (baseline) | 32.0% (16/50) | 153 tok/s |
+| MLX (first 10, max_tokens=512) | 50.0% (5/10) | 154.3 tok/s |
+| LLMs.jl q4-opt (first 10, max_tokens=512) | 50.0% (5/10) | 36.5 tok/s |
 
-Run: `python scripts/bench_math50.py`
+Run the MLX baseline:
+
+```bash
+uv run --with mlx --with mlx-lm python3 scripts/bench_math50.py --max-tokens 512
+```
+
+Run the LLMs.jl quantized backend:
+
+```bash
+julia --project=. scripts/bench_math50.jl --backend q4-opt --max-tokens 512
+```
+
+Use `--limit N` on either benchmark for shorter smoke runs. The Julia runner writes per-problem JSONL and summary artifacts under `results/`.
+
+Note: Llama uses MLX's non-traditional split-half RoPE convention. Using adjacent-pair RoPE caused long chat/math prompts to collapse into repetitive punctuation/digits while simple short prompts still looked plausible.
 
 ### End-to-end throughput (MPSGraph, FP16, 28-layer forward pass)
 
