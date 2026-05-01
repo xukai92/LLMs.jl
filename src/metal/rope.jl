@@ -3,9 +3,9 @@ Rotary Position Embedding (RoPE).
 
 Applies rotation to Q and K vectors using precomputed cos/sin tables.
 
-For each pair of elements (x[2i-1], x[2i]) at position pos:
-    x_rot[2i-1] = x[2i-1] * cos[i, pos] - x[2i] * sin[i, pos]
-    x_rot[2i]   = x[2i-1] * sin[i, pos] + x[2i] * cos[i, pos]
+For Llama/MLX's non-traditional RoPE, rotate split halves:
+    x_rot[i]      = x[i]      * cos[i, pos] - x[i+half] * sin[i, pos]
+    x_rot[i+half] = x[i+half] * cos[i, pos] + x[i]      * sin[i, pos]
 
 Llama-3.2: head_dim=128, rope_theta=500000.0, with frequency scaling.
 """
@@ -85,12 +85,12 @@ function rope_cpu!(x::AbstractArray{T, 3}, cos_table::AbstractMatrix{Float32},
         pos = start_pos + s - 1
         for h in 1:n_heads
             @inbounds for i in 1:half
-                x1 = Float32(x[2i-1, h, s])
-                x2 = Float32(x[2i, h, s])
+                x1 = Float32(x[i, h, s])
+                x2 = Float32(x[i+half, h, s])
                 c = cos_table[i, pos]
                 sn = sin_table[i, pos]
-                x[2i-1, h, s] = T(x1 * c - x2 * sn)
-                x[2i, h, s]   = T(x1 * sn + x2 * c)
+                x[i, h, s]      = T(x1 * c - x2 * sn)
+                x[i+half, h, s] = T(x1 * sn + x2 * c)
             end
         end
     end
@@ -115,12 +115,12 @@ function rope_kernel!(x, cos_table, sin_table, start_pos::Int32, half_dim::Int32
     pos = start_pos + Int32(s) - Int32(1)  # actual position for RoPE table
 
     @inbounds begin
-        x1 = Float32(x[2*i-1, h, s])
-        x2 = Float32(x[2*i, h, s])
+        x1 = Float32(x[i, h, s])
+        x2 = Float32(x[i+half_dim, h, s])
         c  = cos_table[i, pos]
         sn = sin_table[i, pos]
-        x[2*i-1, h, s] = typeof(x[1,1,1])(x1 * c - x2 * sn)
-        x[2*i, h, s]   = typeof(x[1,1,1])(x1 * sn + x2 * c)
+        x[i, h, s]          = typeof(x[1,1,1])(x1 * c - x2 * sn)
+        x[i+half_dim, h, s] = typeof(x[1,1,1])(x1 * sn + x2 * c)
     end
 
     return nothing
@@ -155,17 +155,17 @@ function rope_qk_kernel!(q, k, cos_table, sin_table, start_pos::Int32,
 
     # Process Q head
     if Int32(h) <= n_q
-        @inbounds x1 = Float32(q[2*i-1, h, s])
-        @inbounds x2 = Float32(q[2*i, h, s])
-        @inbounds q[2*i-1, h, s] = typeof(q[1,1,1])(x1 * c - x2 * sn)
-        @inbounds q[2*i, h, s]   = typeof(q[1,1,1])(x1 * sn + x2 * c)
+        @inbounds x1 = Float32(q[i, h, s])
+        @inbounds x2 = Float32(q[i+half_dim, h, s])
+        @inbounds q[i, h, s]          = typeof(q[1,1,1])(x1 * c - x2 * sn)
+        @inbounds q[i+half_dim, h, s] = typeof(q[1,1,1])(x1 * sn + x2 * c)
     end
     # Process K head (same cos/sin, different head count)
     if Int32(h) <= n_kv
-        @inbounds x1 = Float32(k[2*i-1, h, s])
-        @inbounds x2 = Float32(k[2*i, h, s])
-        @inbounds k[2*i-1, h, s] = typeof(k[1,1,1])(x1 * c - x2 * sn)
-        @inbounds k[2*i, h, s]   = typeof(k[1,1,1])(x1 * sn + x2 * c)
+        @inbounds x1 = Float32(k[i, h, s])
+        @inbounds x2 = Float32(k[i+half_dim, h, s])
+        @inbounds k[i, h, s]          = typeof(k[1,1,1])(x1 * c - x2 * sn)
+        @inbounds k[i+half_dim, h, s] = typeof(k[1,1,1])(x1 * sn + x2 * c)
     end
     return nothing
 end
