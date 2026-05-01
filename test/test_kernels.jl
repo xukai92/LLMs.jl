@@ -301,19 +301,14 @@ end
     # ═══════════════════════════════════════════
     @testset "Quantized Matmul" begin
         @testset "Dequantize correctness" begin
-            # Create a simple quantized weight: 2 rows, 16 cols (2 packed cols)
+            # Create a simple quantized weight: 1 row, 16 cols (2 packed cols)
             # group_size=8 for this small test
-            packed = UInt32[
-                0x76543210 0xFEDCBA98;  # row 1: values 0,1,2,...,F
-            ]  # shape: (1, 2) — but Julia is col-major so we handle carefully
-
-            # Actually let's be more careful with the layout.
-            # packed[row, packed_col]
-            # For row=1, packed_col=1: 0x76543210 → unpacks to [0,1,2,3,4,5,6,7]
-            # For row=1, packed_col=2: 0xFEDCBA98 → unpacks to [8,9,10,11,12,13,14,15]
-            packed = reshape(UInt32[0x76543210, 0xFEDCBA98], 1, 2)
-            scales = reshape(Float16[1.0, 1.0], 1, 2)
-            biases = reshape(Float16[0.0, 0.0], 1, 2)
+            # Layout is packed[packed_col, row], scales[group, row].
+            # For row=1, packed_col=1: 0x76543210 -> [0,1,2,3,4,5,6,7]
+            # For row=1, packed_col=2: 0xFEDCBA98 -> [8,9,10,11,12,13,14,15]
+            packed = reshape(UInt32[0x76543210, 0xFEDCBA98], 2, 1)
+            scales = reshape(Float16[1.0, 1.0], 2, 1)
+            biases = reshape(Float16[0.0, 0.0], 2, 1)
 
             W = dequantize_cpu(packed, scales, biases; bits=4, group_size=8)
             @test size(W) == (1, 16)
@@ -338,9 +333,9 @@ end
             # Create random quantized weights
             packed_cols = I ÷ 8
             n_groups = I ÷ group_size
-            packed = rand(UInt32, O, packed_cols)
-            scales = Float16.(rand(Float32, O, n_groups) * 0.1f0)
-            biases = Float16.(rand(Float32, O, n_groups) * 0.01f0 .- 0.005f0)
+            packed = rand(UInt32, packed_cols, O)
+            scales = Float16.(rand(Float32, n_groups, O) * 0.1f0)
+            biases = Float16.(rand(Float32, n_groups, O) * 0.01f0 .- 0.005f0)
             x = Float16.(randn(Float32, I, B) * 0.1f0)
 
             out_cpu = zeros(Float16, O, B)
@@ -362,9 +357,9 @@ end
 
             packed_cols = I ÷ 8
             n_groups = I ÷ group_size
-            packed = rand(UInt32, O, packed_cols)
-            scales = Float16.(rand(Float32, O, n_groups) * 0.1f0)
-            biases = Float16.(rand(Float32, O, n_groups) * 0.01f0 .- 0.005f0)
+            packed = rand(UInt32, packed_cols, O)
+            scales = Float16.(rand(Float32, n_groups, O) * 0.1f0)
+            biases = Float16.(rand(Float32, n_groups, O) * 0.01f0 .- 0.005f0)
             x = Float16.(randn(Float32, I, B) * 0.1f0)
 
             out_cpu = zeros(Float16, O, B)

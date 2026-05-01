@@ -2,19 +2,19 @@
 4-bit Quantized Matrix-Vector / Matrix-Matrix Multiplication.
 
 MLX quantization format:
-- weight: UInt32 array (O, I/8) — each uint32 packs 8 4-bit values
-- scales: Float16 array (O, I/group_size) — per-group scale
-- biases: Float16 array (O, I/group_size) — per-group bias
+- weight: UInt32 array (I/8, O) — each uint32 packs 8 4-bit values
+- scales: Float16 array (I/group_size, O) — per-group scale
+- biases: Float16 array (I/group_size, O) — per-group bias
 - Dequantization: w_float = scale * float(unpack_4bit(packed)) + bias
 
 Computes: out = x @ W^T (with on-the-fly dequantization)
   x: (I, B) input activations, Float16
-  W: (O, I/8) packed weights, UInt32
+  W: (I/8, O) packed weights, UInt32
   out: (O, B) output, Float16
 
 For Llama-3.2-3B with group_size=64, bits=4:
-  q_proj: I=3072, O=3072, packed=(3072, 384), scales=(3072, 48)
-  k_proj: I=3072, O=1024, packed=(1024, 384), scales=(1024, 48)
+  q_proj: I=3072, O=3072, packed=(384, 3072), scales=(48, 3072)
+  k_proj: I=3072, O=1024, packed=(384, 1024), scales=(48, 1024)
 """
 
 # ── CPU reference ──
